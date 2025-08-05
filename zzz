@@ -1,247 +1,148 @@
-# GTAd Historical Clock Implementation Proposal
-## With Next Packet Timestamp Support for Lab Mode
+# GTAd Historical Clock Implementation for Lab Mode
+## Accurate Timer Replay for Latency Analysis
 
 ### Executive Summary
-This proposal modifies the existing GTAd timer system to support historical clock mode for deterministic replay. The key addition is utilizing "next packet timestamp" information from market data replay feeds to fire timers between packets, providing more realistic timing behavior in lab environments.
+
+This proposal implements a historical clock mode for GTAd to enable accurate replay of timer behavior during backtesting. By using market data packet timestamps and "next packet timestamp" information, we can fire timers at their originally scheduled times rather than batching them at packet arrivals. This is essential for accurate latency analysis in lab environments.
+
+### Key Design Principles
+
+1. **Production binary unchanged** - Uses compile-time flag to create separate lab binary
+2. **Minimal code changes** - Surgical modifications to timer infrastructure only  
+3. **Zero production risk** - Lab-only features with multiple safety checks
+4. **Accurate timing replay** - Timers fire at scheduled times, not packet arrivals
 
 ### Architecture Overview
 
 ```mermaid
 flowchart TB
-    subgraph "Current Implementation"
+    subgraph "Production Build (Default)"
         A1[Market Data Event] --> B1[Process MD]
         B1 --> C1[Strategy Logic]
-        D1[Real Clock] --> E1[Timer Check]
+        D1[Real Clock<br/>wall time] --> E1[Timer Check]
         E1 --> F1[Fire Timers]
     end
     
-    subgraph "Proposed Implementation"
-        A2[Market Data Event<br/>+ Next Packet TS] --> B2{Historical<br/>Mode?}
-        B2 -->|No| C2[Process MD]
-        B2 -->|Yes| D2[Advance Clock]
-        D2 --> E2{Next TS<br/>Available?}
-        E2 -->|Yes| F2[Fire Timers<br/>Between Packets]
-        E2 -->|No| G2[Fire Timers<br/>at Current]
-        F2 --> C2
-        G2 --> C2
-        C2 --> H2[Strategy Logic]
+    subgraph "Lab Build (-DGTAD_LAB_BUILD)"
+        A2[Market Data Event<br/>+ Next Packet TS] --> B2[Advance Historical Clock]
+        B2 --> C2{Next TS<br/>Available?}
+        C2 -->|Yes| D2[Fire Timers up to<br/>Next Packet Time]
+        C2 -->|No| E2[Fire Timers up to<br/>Current Time]
+        D2 --> F2[Process MD]
+        E2 --> F2
+        F2 --> G2[Strategy Logic]
         
-        I2[Clock Interface] --> J2{Clock Type}
-        J2 -->|Prod| K2[Real Clock]
-        J2 -->|Lab| L2[Historical Clock]
+        H2[Historical Clock<br/>packet timestamps] --> I2[Timer Check]
     end
     
-    style B2 fill:#f9f,stroke:#333,stroke-width:2px
-    style E2 fill:#f9f,stroke:#333,stroke-width:2px
-    style I2 fill:#9f9,stroke:#333,stroke-width:2px
+    style A2 fill:#9ff,stroke:#333,stroke-width:2px
+    style C2 fill:#f9f,stroke:#333,stroke-width:2px
+    style H2 fill:#9f9,stroke:#333,stroke-width:2px
 ```
 
-### 1. Current Implementation Analysis
-
-#### 1.1 Current Timer Expiry Check (GTADFramework.cpp)
-```cpp
-// Current implementation - lines 29-36
-void GTADFramework::StrategyThread::checkTimerExpiry()
-{
-    if (unlikely(framework_.timerExpiryWatcher_.nextTimerExpired()))
-    {
-        framework_.timer_mgr_.expire(framework_.timerExpiryWatcher_.now());
-        GTAD_LOG_DEBUG(log_, "Done processing timers");
-    }
-}
-```
-
-#### 1.2 Current Timer Watcher (Timer.h)
-```cpp
-// Current implementation - lines 26-42
-bool nextTimerExpired()
-{
-    now_ = ::util::real_clock::RealtimeClock::now().time_since_epoch();
-    
-    if (nextExpiry_ == std::chrono::nanoseconds::zero())
-    {
-        return false;
-    }
-    
-    if (unlikely(now_ > nextExpiry_))
-    {
-        GTAG_LOG_DEBUG(log_,
-            "Running expired timers for current time, earliest is " << pa::DatePrinter(nextExpiry_));
-        return true;
-    }
-    return false;
-}
-```
-
-#### 1.3 Current Market Data Event Structure (Frameworks.h)
-```cpp
-// Current implementation - lines 81-90
-struct MDBBOEvent
-{
-    MDBBOEvent(px::MDLevelSnapshot snapshot, LatencyContext::MktData mdLatency) :
-        snapshot(snapshot), mdLatency(mdLatency)
-    {
-    }
-
-    px::MDLevelSnapshot snapshot;
-    LatencyContext::MktData mdLatency;
-};
-```
-
-#### 1.4 Current Market Data Processing (GTADFramework.h)
-```cpp
-// Current implementation - lines 103-106
-void operator()(const frameworkEvents::MDBBOEvent& event)
-{
-    framework_.strategy_.on_market_data(framework_.thread_.queue_.size(), event.snapshot, event.mdLatency);
-}
-```
-
-#### 1.5 Market Data Object with Exchange Timestamp (MktDataCommon.h)
-```cpp
-// Current implementation - lines 238-250
-class MDObject
-{
-    // ... other members ...
-    uint64_t m_exchange_time_64{0}; // exchange timestamp - already available!
-    // ... other members ...
-};
-```
-
-### Timer Firing Timeline
-
-The key innovation is firing timers between market data packets:
+### Problem: Current Timer Batching in Replay
 
 ```mermaid
 gantt
-    title Timer Firing Behavior Comparison
+    title Current Replay Behavior - Timers Batch at Packet Arrival
     dateFormat X
     axisFormat %L ms
     
-    section Current Behavior
+    section Events
     Packet 1 arrives         :milestone, p1, 0, 0
+    Timer A scheduled        :done, ta, 0, 500
+    Timer B scheduled        :done, tb, 0, 1500
     Packet 2 arrives         :milestone, p2, 1000, 0
     Packet 3 arrives         :milestone, p3, 2000, 0
-    Timer A (500ms)          :crit, t1, 1000, 0
-    Timer B (1500ms)         :crit, t2, 2000, 0
     
-    section Proposed Behavior
-    Packet 1 arrives         :milestone, p1b, 0, 0
-    Timer A fires            :done, t1b, 500, 0
-    Packet 2 arrives         :milestone, p2b, 1000, 0
-    Timer B fires            :done, t2b, 1500, 0
-    Packet 3 arrives         :milestone, p3b, 2000, 0
+    section Actual Firing
+    Timer A fires late       :crit, taf, 1000, 0
+    Timer B fires late       :crit, tbf, 2000, 0
 ```
 
-**Current**: Timers only fire when packets arrive (may batch multiple timers)  
-**Proposed**: Timers fire at their scheduled time between packets
+**Issue**: Timer A (scheduled for 500ms) doesn't fire until Packet 2 arrives at 1000ms. This hides 500ms of latency in analysis.
 
-### 2. Proposed Changes
-
-#### 2.1 Add Clock Interface to Support Both Modes
+### Solution: Fire Timers Between Packets
 
 ```mermaid
-classDiagram
-    class ISystemClock {
-        <<interface>>
-        +now() nanoseconds
-        +advanceTime(nanoseconds) void
-        +isHistorical() bool
-    }
+gantt
+    title Proposed Behavior - Timers Fire at Scheduled Time
+    dateFormat X
+    axisFormat %L ms
     
-    class RealTimeClock {
-        +now() nanoseconds
-        +advanceTime(nanoseconds) void
-        +isHistorical() bool
-    }
-    
-    class HistoricalClock {
-        -currentTime atomic~nanoseconds~
-        +now() nanoseconds
-        +advanceTime(nanoseconds) void
-        +isHistorical() bool
-    }
-    
-    class TimerExpiryWatcher {
-        -clock unique_ptr~ISystemClock~
-        +setClock(clock) void
-        +getClock() ISystemClock*
-        +nextTimerExpired() bool
-    }
-    
-    ISystemClock <|.. RealTimeClock
-    ISystemClock <|.. HistoricalClock
-    TimerExpiryWatcher --> ISystemClock : uses
-    
-    note for RealTimeClock "Returns system time\nadvanceTime() is no-op"
-    note for HistoricalClock "Returns stored time\nOnly advances via advanceTime()"
+    section Events
+    Packet 1 arrives         :milestone, p1, 0, 0
+    Timer A fires on time    :done, taf, 500, 0
+    Packet 2 arrives         :milestone, p2, 1000, 0
+    Timer B fires on time    :done, tbf, 1500, 0
+    Packet 3 arrives         :milestone, p3, 2000, 0
 ```
 
-**New file: ISystemClock.h**
+## Implementation
+
+### 1. Compile-Time Clock Selection
+
+**File: Timer.h**
 ```cpp
 #pragma once
+
 #include <chrono>
+#include <memory>
+#include <spapp/event/timer_manager.hpp>
+#include "framework/common.h"
+#include "framework/alarm.h"
+#include "util/real_clock.h"
+#include "util/log.h"
 
-// Abstract interface for clock - allows switching between real and historical
-class ISystemClock {
-public:
-    virtual ~ISystemClock() = default;
-    virtual std::chrono::nanoseconds now() const = 0;
-    virtual void advanceTime(std::chrono::nanoseconds newTime) = 0;
-    virtual bool isHistorical() const = 0;
-};
+class LatencyContext;
 
-// Production clock - wraps existing real_clock
-class RealTimeClock : public ISystemClock {
+// Single compile-time switch for lab vs production build
+#ifdef GTAD_LAB_BUILD
+
+// Lab mode: Historical clock that advances via packet timestamps
+class HistoricalClock {
 public:
-    std::chrono::nanoseconds now() const override {
-        return ::util::real_clock::RealtimeClock::now().time_since_epoch();
+    using duration = std::chrono::nanoseconds;
+    using rep = duration::rep;
+    using period = duration::period;
+    using time_point = std::chrono::time_point<HistoricalClock>;
+    static constexpr bool is_steady = false;
+    
+    static time_point now() {
+        return time_point(currentTime_.load(std::memory_order_acquire));
     }
     
-    void advanceTime(std::chrono::nanoseconds) override {
-        // No-op - real clock advances naturally
-    }
-    
-    bool isHistorical() const override { return false; }
-};
-
-// Historical clock for replay - time only advances when we tell it
-class HistoricalClock : public ISystemClock {
-private:
-    std::atomic<std::chrono::nanoseconds> currentTime_{0};
-    
-public:
-    std::chrono::nanoseconds now() const override {
-        return currentTime_.load(std::memory_order_acquire);
-    }
-    
-    void advanceTime(std::chrono::nanoseconds newTime) override {
+    static void advanceTime(std::chrono::nanoseconds newTime) {
         auto oldTime = currentTime_.load();
-        // Only advance forward to maintain causality
         if (newTime > oldTime) {
             currentTime_.store(newTime, std::memory_order_release);
         }
     }
     
-    bool isHistorical() const override { return true; }
+    static void reset() {
+        currentTime_.store(std::chrono::nanoseconds(0));
+    }
+    
+private:
+    static std::atomic<std::chrono::nanoseconds> currentTime_;
 };
-```
 
-#### 2.2 Modify TimerExpiryWatcher to Use Clock Interface
+// Static member definition
+std::atomic<std::chrono::nanoseconds> HistoricalClock::currentTime_{0};
 
-**Changes to Timer.h:**
-```cpp
+using ClockType = HistoricalClock;
+
+#else
+
+// Production mode: Use existing real clock
+using ClockType = ::util::real_clock::RealtimeClock;
+
+#endif
+
 struct TimerExpiryWatcher
 {
     TimerExpiryWatcher() : log_(GTAG_GET_LOGGER("TimerExpiryWatcher"))
     {
-        // ADD: Default to real clock for backward compatibility
-        clock_ = std::make_unique<RealTimeClock>();
-    }
-
-    // ADD: Allow injection of different clock implementations
-    void setClock(std::unique_ptr<ISystemClock> clock) {
-        clock_ = std::move(clock);
     }
 
     void notify(std::chrono::nanoseconds nextExpiry)
@@ -251,9 +152,8 @@ struct TimerExpiryWatcher
 
     bool nextTimerExpired()
     {
-        // CHANGE: Use injected clock instead of direct real_clock call
-        // OLD: now_ = ::util::real_clock::RealtimeClock::now().time_since_epoch();
-        now_ = clock_->now();  // NEW: Use abstracted clock
+        // Now uses ClockType which is either RealTimeClock or HistoricalClock
+        now_ = ClockType::now().time_since_epoch();
         
         if (nextExpiry_ == std::chrono::nanoseconds::zero())
         {
@@ -273,412 +173,212 @@ struct TimerExpiryWatcher
     {
         return now_;
     }
-    
-    // ADD: Expose clock for historical mode operations
-    ISystemClock* getClock() { return clock_.get(); }
 
 private:
     // ... existing members ...
-    
-    // ADD: Clock abstraction
-    std::unique_ptr<ISystemClock> clock_;
 };
+
+// Timer manager now uses ClockType (compile-time selected)
+using spappTimerManager = sp::event::timer_manager<ClockType, TimerExpiryWatcherWrapper>;
+
+// ... rest of Timer.h unchanged ...
 ```
 
-#### 2.3 Add Next Packet Timestamp to Market Data Events
+### 2. Add Next Packet Timestamp to Events
 
-**Changes to Frameworks.h:**
+**File: Frameworks.h**
 ```cpp
-// MODIFY: Add next packet timestamp field to market data events
-struct MDBBOEvent
+namespace frameworkEvents
 {
-    MDBBOEvent(px::MDLevelSnapshot snapshot, LatencyContext::MktData mdLatency) :
-        snapshot(snapshot), mdLatency(mdLatency)
+    struct MDBBOEvent
     {
-    }
-
-    px::MDLevelSnapshot snapshot;
-    LatencyContext::MktData mdLatency;
-    
-    // ADD: Optional next packet timestamp for replay mode
-    // This field will be populated by replay infrastructure when available
-    // In production, this will remain empty (std::nullopt)
-    std::optional<std::chrono::nanoseconds> nextPacketTimestamp;
-};
-
-// Similar additions to other market data event types
-struct MOAuctionSummaryEvent
-{
-    MOAuctionSummaryEvent(px::MOAuctionSummary data, LatencyContext::MktData mdLatency) :
-        data(data), mdLatency(mdLatency)
-    {
-    }
-
-    px::MOAuctionSummary data;
-    LatencyContext::MktData mdLatency;
-    std::optional<std::chrono::nanoseconds> nextPacketTimestamp;  // ADD
-};
-
-struct MOOpenCloseEvent
-{
-    MOOpenCloseEvent(px::MOOpenClose data, LatencyContext::MktData mdLatency) : 
-        data(data), mdLatency(mdLatency)
-    {
-    }
-
-    px::MOOpenClose data;
-    LatencyContext::MktData mdLatency;
-    std::optional<std::chrono::nanoseconds> nextPacketTimestamp;  // ADD
-};
-```
-
-#### 2.4 Modify Market Data Processing to Advance Clock and Fire Timers
-
-**Changes to GTADFramework.h Processor class:**
-```cpp
-void operator()(const frameworkEvents::MDBBOEvent& event)
-{
-    // ADD: In historical mode, advance clock and check timers
-    auto* clock = framework_.timerExpiryWatcher_.getClock();
-    if (clock->isHistorical() && event.snapshot.m_exchange_time_64 > 0) {
-        auto currentPacketTime = std::chrono::nanoseconds(event.snapshot.m_exchange_time_64);
-        auto previousTime = clock->now();
-        
-        // Advance clock to current packet time
-        clock->advanceTime(currentPacketTime);
-        
-        // ADD: If we have next packet timestamp, fire timers between packets
-        if (event.nextPacketTimestamp && framework_.useNextPacketTimestamp_) {
-            // Fire all timers that would expire before the next packet arrives
-            // This gives us more realistic timer behavior in replay
-            
-            // We need to check and fire timers for all times between current and next
-            // But we don't want to advance the clock past current packet time
-            framework_.fireTimersBetweenPackets(previousTime, currentPacketTime, *event.nextPacketTimestamp);
-        } else {
-            // Fallback: just check timers up to current packet time
-            framework_.thread_.checkTimerExpiry();
+        MDBBOEvent(px::MDLevelSnapshot snapshot, LatencyContext::MktData mdLatency) :
+            snapshot(snapshot), mdLatency(mdLatency)
+        {
         }
-    }
-    
-    // EXISTING: Process market data as normal
-    framework_.strategy_.on_market_data(framework_.thread_.queue_.size(), event.snapshot, event.mdLatency);
-}
 
-// Similar changes for MOAuctionSummaryEvent
-void operator()(const frameworkEvents::MOAuctionSummaryEvent& event)
-{
-    // ADD: Same clock advancement logic
-    auto* clock = framework_.timerExpiryWatcher_.getClock();
-    if (clock->isHistorical() && event.data.m_exchange_time_64 > 0) {
-        auto currentPacketTime = std::chrono::nanoseconds(event.data.m_exchange_time_64);
-        auto previousTime = clock->now();
+        px::MDLevelSnapshot snapshot;
+        LatencyContext::MktData mdLatency;
         
-        clock->advanceTime(currentPacketTime);
-        
-        if (event.nextPacketTimestamp && framework_.useNextPacketTimestamp_) {
-            framework_.fireTimersBetweenPackets(previousTime, currentPacketTime, *event.nextPacketTimestamp);
-        } else {
-            framework_.thread_.checkTimerExpiry();
-        }
-    }
+#ifdef GTAD_LAB_BUILD
+        // Only in lab builds - zero overhead in production
+        std::optional<std::chrono::nanoseconds> nextPacketTimestamp;
+#endif
+    };
     
-    // EXISTING: Process auction summary
-    framework_.strategy_.on_auction_summary_data(framework_.thread_.queue_.size(), event.data,
-                                               event.mdLatency);
-}
-
-// Similar for MOOpenCloseEvent
-void operator()(const frameworkEvents::MOOpenCloseEvent& event)
-{
-    // ADD: Same pattern
-    auto* clock = framework_.timerExpiryWatcher_.getClock();
-    if (clock->isHistorical() && event.data.m_exchange_time_64 > 0) {
-        auto currentPacketTime = std::chrono::nanoseconds(event.data.m_exchange_time_64);
-        auto previousTime = clock->now();
-        
-        clock->advanceTime(currentPacketTime);
-        
-        if (event.nextPacketTimestamp && framework_.useNextPacketTimestamp_) {
-            framework_.fireTimersBetweenPackets(previousTime, currentPacketTime, *event.nextPacketTimestamp);
-        } else {
-            framework_.thread_.checkTimerExpiry();
-        }
-    }
-    
-    // EXISTING: Process open/close
-    framework_.strategy_.on_market_open_close_data(framework_.thread_.queue_.size(), event.data,
-                                                 event.mdLatency);
+    // Similar additions to other market data events...
 }
 ```
 
-#### 2.5 Add Helper Method to Fire Timers Between Packets
+### 3. Process Market Data with Historical Clock
 
-**Add to GTADFramework class:**
+**File: GTADFramework.h**
 ```cpp
+class GTADFramework {
+    // ... existing code ...
+    
 private:
-    // ADD: Fire timers that would expire between current and next packet
-    void fireTimersBetweenPackets(std::chrono::nanoseconds previousTime,
-                                  std::chrono::nanoseconds currentTime,
-                                  std::chrono::nanoseconds nextPacketTime) {
-        // Validate next packet timestamp
-        if (nextPacketTime <= currentTime) {
-            GTAD_LOG_WARN(log_, "Invalid next packet timestamp - not greater than current");
-            thread_.checkTimerExpiry();
-            return;
-        }
-        
-        // The timer manager needs to know to fire all timers up to (but not including) nextPacketTime
-        // This is more complex than just calling expire() once, as we need to maintain
-        // the clock at currentTime while checking timers up to nextPacketTime
-        
-        // Save current clock time
-        auto* clock = timerExpiryWatcher_.getClock();
-        
-        // Temporarily advance clock to just before next packet to catch all timers
-        auto checkUpToTime = nextPacketTime - std::chrono::nanoseconds(1);
-        clock->advanceTime(checkUpToTime);
-        
-        // Fire any expired timers
-        if (timerExpiryWatcher_.nextTimerExpired()) {
-            timer_mgr_.expire(checkUpToTime);
-        }
-        
-        // Restore clock to current packet time
-        clock->advanceTime(currentTime);
+    class StrategyThread final : public service::PinnedThreadedService
+    {
+        class Processor
+        {
+            void operator()(const frameworkEvents::MDBBOEvent& event)
+            {
+#ifdef GTAD_LAB_BUILD
+                // Lab mode: Advance historical clock and fire timers between packets
+                if (event.snapshot.m_exchange_time_64 > 0) {
+                    auto currentPacketTime = std::chrono::nanoseconds(event.snapshot.m_exchange_time_64);
+                    
+                    // Advance clock to current packet timestamp
+                    HistoricalClock::advanceTime(currentPacketTime);
+                    
+                    // If next packet timestamp available, fire timers up to that point
+                    if (event.nextPacketTimestamp && framework_.useNextPacketTimestamp_) {
+                        // Fire all timers that expire before next packet
+                        // This recreates original timing behavior
+                        auto fireUpToTime = *event.nextPacketTimestamp - std::chrono::nanoseconds(1);
+                        if (framework_.timerExpiryWatcher_.nextTimerExpired()) {
+                            framework_.timer_mgr_.expire(fireUpToTime);
+                        }
+                    } else {
+                        // No next timestamp - just check current time
+                        framework_.thread_.checkTimerExpiry();
+                    }
+                }
+#endif
+                // Process market data normally
+                framework_.strategy_.on_market_data(framework_.thread_.queue_.size(), 
+                                                  event.snapshot, event.mdLatency);
+            }
+            
+            // Similar changes for MOAuctionSummaryEvent and MOOpenCloseEvent...
+        };
+    };
+    
+#ifdef GTAD_LAB_BUILD
+    bool useNextPacketTimestamp_{true};  // Configurable via XML
+    
+    // Safety check - only enable features if environment allows
+    bool isLabEnvironment() const {
+        return std::getenv("GTAD_LAB_MODE") != nullptr;
     }
+#endif
+};
 ```
 
-#### 2.6 Framework Configuration and Initialization
-
-### Safety Checks Flow
+### 4. Safety Mechanisms
 
 ```mermaid
 flowchart TD
-    A[Config: EnableHistoricalMode=true] --> B{Environment Check}
-    B -->|GTAD_LAB_MODE not set| C[Use Real Clock<br/>Log Warning]
-    B -->|GTAD_LAB_MODE set| D{Hostname Check}
-    D -->|Contains 'prod'| C
-    D -->|Lab hostname| E[Enable Historical Clock]
-    E --> F{UseNextPacketTimestamp?}
-    F -->|Yes| G[Enable Next Packet TS Feature]
-    F -->|No| H[Basic Historical Mode]
+    A[Lab Binary Started] --> B{GTAD_LAB_MODE<br/>env var set?}
+    B -->|No| C[Fatal Error:<br/>"Lab binary requires<br/>GTAD_LAB_MODE=1"]
+    B -->|Yes| D{Hostname Check}
+    D -->|Contains 'prod'| E[Fatal Error:<br/>"Cannot run lab binary<br/>on production host"]
+    D -->|Lab hostname| F[Initialize with<br/>Historical Clock]
+    F --> G{Config: UseNextPacketTS?}
+    G -->|Yes| H[Enable Between-Packet<br/>Timer Firing]
+    G -->|No| I[Basic Historical Mode]
     
-    I[Production Environment] --> J[Next Packet TS Field Empty]
-    J --> K[No Impact on Timers]
-    
-    style A fill:#faa,stroke:#333,stroke-width:2px
-    style C fill:#afa,stroke:#333,stroke-width:2px
-    style E fill:#aaf,stroke:#333,stroke-width:2px
+    style C fill:#faa,stroke:#333,stroke-width:2px
+    style E fill:#faa,stroke:#333,stroke-width:2px
+    style F fill:#afa,stroke:#333,stroke-width:2px
 ```
 
-**Changes to GTADFramework.h:**
+**Implementation in GTADFramework constructor:**
 ```cpp
-class GTADFramework {
-    // ... existing members ...
-    
-    // ADD: Configuration flags for historical mode
-    bool useHistoricalClock_{false};
-    bool useNextPacketTimestamp_{false};
-    
-    // ADD: Safety check for lab-only feature
-    bool isLabEnvironment() const {
-        // Check 1: Environment variable
-        if (std::getenv("GTAD_LAB_MODE") == nullptr) {
-            return false;
-        }
-        
-        // Check 2: Hostname check
-        char hostname[256];
-        if (gethostname(hostname, sizeof(hostname)) == 0) {
-            std::string host(hostname);
-            if (host.find("prod") != std::string::npos) {
-                return false;
-            }
-        }
-        
-        return true;
+#ifdef GTAD_LAB_BUILD
+    // Lab build safety checks
+    if (!isLabEnvironment()) {
+        GTAD_LOG_FATAL(log_, "Lab binary requires GTAD_LAB_MODE=1 environment variable");
+        throw std::runtime_error("Lab binary safety check failed");
     }
+    
+    char hostname[256];
+    if (gethostname(hostname, sizeof(hostname)) == 0) {
+        std::string host(hostname);
+        if (host.find("prod") != std::string::npos) {
+            GTAD_LOG_FATAL(log_, "Lab binary cannot run on production host: " << host);
+            throw std::runtime_error("Lab binary on production host");
+        }
+    }
+    
+    GTAD_LOG_INFO(log_, "Lab binary initialized with historical clock support");
+    
+    // Check config for next packet timestamp usage
+    if (cfg.LabMode().present() && cfg.LabMode().get().UseNextPacketTimestamp().present()) {
+        useNextPacketTimestamp_ = cfg.LabMode().get().UseNextPacketTimestamp().get();
+    }
+#endif
 ```
 
-**Changes to GTADFramework constructor:**
-```cpp
-template <typename ConfigType>
-GTADFramework(const ConfigType& cfg, /* ... existing params ... */) :
-    // ... existing initializations ...
-{
-    // ... existing constructor code ...
-    
-    // ADD: Initialize historical clock if configured and in lab environment
-    if (cfg.HistoricalMode().present() && 
-        cfg.HistoricalMode().get().EnableHistoricalMode() && 
-        isLabEnvironment()) {
-        
-        GTAD_LOG_INFO(log_, "Enabling historical clock mode for replay");
-        
-        // Replace the default real clock with historical clock
-        auto historicalClock = std::make_unique<HistoricalClock>();
-        timerExpiryWatcher_.setClock(std::move(historicalClock));
-        
-        useHistoricalClock_ = true;
-        
-        // Check if we should use next packet timestamp feature
-        if (cfg.HistoricalMode().get().UseNextPacketTimestamp().present()) {
-            useNextPacketTimestamp_ = cfg.HistoricalMode().get().UseNextPacketTimestamp().get();
-            GTAD_LOG_INFO(log_, "Next packet timestamp feature: " 
-                         << (useNextPacketTimestamp_ ? "enabled" : "disabled"));
-        }
-    } else if (cfg.HistoricalMode().present() && 
-               cfg.HistoricalMode().get().EnableHistoricalMode() && 
-               !isLabEnvironment()) {
-        GTAD_LOG_ERROR(log_, "Historical mode requested but not in lab environment - using real clock");
-    }
-}
-```
+### 5. Configuration
 
-### 3. Configuration Schema
-
-**Add to existing XML schema:**
 ```xml
-<!-- Add to strategy configuration schema -->
-<xs:complexType name="HistoricalModeConfig">
-    <xs:sequence>
-        <xs:element name="EnableHistoricalMode" type="xs:boolean" default="false">
-            <xs:annotation>
-                <xs:documentation>
-                    Enable historical clock mode for deterministic replay.
-                    Only works in lab environment (requires GTAD_LAB_MODE env var).
-                </xs:documentation>
-            </xs:annotation>
-        </xs:element>
-        <xs:element name="UseNextPacketTimestamp" type="xs:boolean" default="true" minOccurs="0">
-            <xs:annotation>
-                <xs:documentation>
-                    If true, use next packet timestamp from replay feed to fire 
-                    timers between packets. Provides more realistic timing.
-                </xs:documentation>
-            </xs:annotation>
-        </xs:element>
-    </xs:sequence>
-</xs:complexType>
-
-<!-- In main config -->
-<xs:element name="HistoricalMode" type="HistoricalModeConfig" minOccurs="0"/>
+<!-- Only parsed in lab builds -->
+<LabMode>
+    <UseNextPacketTimestamp>true</UseNextPacketTimestamp>
+</LabMode>
 ```
 
-### 4. Market Data Feed Integration
-
-#### Sequence Flow for Processing Market Data with Next Packet Timestamp
+## Sequence Flow
 
 ```mermaid
 sequenceDiagram
     participant RF as Replay Feed
     participant FW as Framework
-    participant P as Processor
-    participant C as Clock
+    participant HC as Historical Clock
     participant TM as Timer Manager
     participant S as Strategy
     
+    Note over HC: Lab Build Only
+    
     RF->>FW: MDBBOEvent {<br/>exchange_time: 1000ms,<br/>nextPacketTimestamp: 2000ms}
-    FW->>P: operator()(event)
-    P->>C: getClock()
-    P->>C: isHistorical()?
-    C-->>P: true
-    P->>C: now()
-    C-->>P: 800ms (previous time)
-    P->>C: advanceTime(1000ms)
-    Note over C: Clock now at 1000ms
+    FW->>HC: advanceTime(1000ms)
+    FW->>TM: nextTimerExpired()?
+    TM->>HC: now()
+    HC-->>TM: 1000ms
     
     alt Next Packet TS Available
-        P->>P: fireTimersBetweenPackets(800ms, 1000ms, 2000ms)
-        P->>C: advanceTime(1999ms)
-        Note over C: Temp advance to check timers
-        P->>TM: expire(1999ms)
-        Note over TM: Fires timer at 1500ms
-        TM-->>S: onTimer() callback
-        P->>C: advanceTime(1000ms)
-        Note over C: Restore to packet time
+        FW->>TM: expire(1999ms)
+        Note over TM: Fire all timers with<br/>expiry <= 1999ms
+        TM->>S: onTimer() // Timer at 1500ms
+        Note over S: Timer fires at correct<br/>historical time
     else No Next Packet TS
-        P->>TM: checkTimerExpiry()
+        FW->>TM: expire(1000ms)
         Note over TM: Only fires timers <= 1000ms
     end
     
-    P->>S: on_market_data(snapshot)
+    FW->>S: on_market_data(snapshot)
 ```
 
-The replay infrastructure needs to populate the `nextPacketTimestamp` field when creating events:
+## Build Process
 
-```cpp
-// In replay feed processor (example)
-void processReplayPacket(const ReplayPacket& packet) {
-    frameworkEvents::MDBBOEvent event(packet.snapshot, calculateLatency(packet));
-    
-    // NEW: Extract next packet timestamp if available in replay metadata
-    if (packet.hasMetadata("next_packet_timestamp")) {
-        event.nextPacketTimestamp = 
-            std::chrono::nanoseconds(packet.getMetadata<int64_t>("next_packet_timestamp"));
-    }
-    
-    framework.push(std::move(event));
-}
+```bash
+# Production build (default, unchanged)
+make gtad
+
+# Lab build with historical clock
+make gtad-lab   # Automatically adds -DGTAD_LAB_BUILD
+
+# Deployment
+production/bin/gtad      # Real clock, no historical features
+lab/bin/gtad-lab         # Historical clock, requires GTAD_LAB_MODE=1
 ```
 
-### 5. Why These Changes?
+## Testing Strategy
 
-1. **Clock abstraction via ISystemClock**: Allows switching between real and historical time without changing timer logic throughout the codebase. The abstraction is injected at a single point (TimerExpiryWatcher).
+1. **Unit Tests**: Verify historical clock advances correctly, timers fire at right times
+2. **Integration Tests**: Replay same scenario with and without next packet timestamps
+3. **Latency Verification**: Confirm timer-triggered orders show correct historical latency
+4. **Safety Tests**: Verify lab binary refuses to run without proper environment
 
-2. **Exchange timestamp already available**: The `m_exchange_time_64` field in MDObject already provides the packet timestamp we need.
+## Summary
 
-3. **Next packet timestamp as optional field**: Adding `std::optional<std::chrono::nanoseconds>` to events means zero overhead in production (field remains empty).
+This implementation provides:
+- **Accurate timer replay** for latency analysis via historical clock
+- **Zero production impact** through compile-time separation
+- **Minimal code changes** with a single `#ifdef GTAD_LAB_BUILD`
+- **Strong safety guarantees** preventing lab binary from running in production
+- **Fire between packets** capability using next packet timestamp information
 
-4. **Processing in existing operators**: We modify the existing market data processing operators to handle clock advancement, keeping all timing logic in one place.
-
-5. **Lab environment checks**: Multiple safety layers prevent accidental use in production.
-
-6. **Minimal blast radius**: Only 4 files need modification, with most changes concentrated in the framework layer.
-
-### 6. Testing Example
-
-```cpp
-TEST(HistoricalClock, TimersFireBetweenPackets) {
-    // Setup framework with historical clock
-    Config cfg;
-    cfg.HistoricalMode().EnableHistoricalMode(true);
-    cfg.HistoricalMode().UseNextPacketTimestamp(true);
-    setenv("GTAD_LAB_MODE", "1", 1);
-    
-    GTADFramework framework(cfg, ...);
-    
-    // Schedule a timer for T+500ms
-    bool timerFired = false;
-    auto timer = framework.scheduleTimer(
-        std::chrono::nanoseconds(1500000000), // 1.5 seconds
-        [&](auto) { timerFired = true; }
-    );
-    
-    // Create market data event at T=1s with next packet at T=2s
-    px::MDLevelSnapshot snapshot;
-    snapshot.m_exchange_time_64 = 1000000000;  // 1 second
-    
-    frameworkEvents::MDBBOEvent event(snapshot, latency);
-    event.nextPacketTimestamp = std::chrono::nanoseconds(2000000000);  // 2 seconds
-    
-    // Process the event
-    processor(event);
-    
-    // Timer should have fired because it was scheduled for 1.5s
-    // which is between current packet (1s) and next packet (2s)
-    EXPECT_TRUE(timerFired);
-}
-```
-
-### 7. Impact Summary
-
-- **Files modified**: 4 (Timer.h, GTADFramework.h/.cpp, Frameworks.h)
-- **New files**: 1 (ISystemClock.h)
-- **Production impact**: Zero - all changes are behind configuration flags and environment checks
-- **Performance impact**: One virtual function call per timer check (negligible)
-- **Memory impact**: ~16 bytes per market data event for optional next timestamp
-- **Risk**: Low - existing behavior unchanged unless explicitly configured
-
-This implementation provides deterministic replay capability with realistic timer firing between packets, while maintaining complete safety for production systems.
+The approach maintains clean separation between production and lab code while enabling accurate historical replay for latency analysis.
