@@ -1,0 +1,358 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# /apps/sp_hfts/latency_portal/main.py
+# ──────────────────────────────────────────────────────────────────────────────
+#!/usr/bin/env python3
+"""
+latency‑portal – FastAPI app that ingests benchmark CSVs placed in
+/apps/sp_hfts/latency_csv/, computes summary statistics, renders an interactive
+dashboard, and exposes a REST status endpoint for CI gating.
+
+Launch manually:
+    uvicorn main:app --reload --host 0.0.0.0 --port 8080
+"""
+
+import base64, io, pathlib, sqlite3, statistics, typing as t, datetime as dt
+import pandas as pd
+
+# ── plotting (headless) ───────────────────────────────────────────────────────
+import matplotlib
+matplotlib.use("Agg")                 # no DISPLAY
+import matplotlib.pyplot as plt
+
+from fastapi import FastAPI, HTTPException, Request, Form
+from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.templating import Jinja2Templates
+
+# ── filesystem paths ─────────────────────────────────────────────────────────
+CSV_DIR = pathlib.Path("/apps/sp_hfts/latency_csv")       # watched folder
+DB_PATH  = CSV_DIR / "runs.db"                            # SQLite lives here
+TPL_DIR  = pathlib.Path(__file__).parent / "templates"
+
+# ── FastAPI setup ────────────────────────────────────────────────────────────
+app       = FastAPI(title="Latency‑Portal")
+templates = Jinja2Templates(directory=str(TPL_DIR))
+
+# ── DB helpers ───────────────────────────────────────────────────────────────
+def _init_db() -> None:
+    """Create table if first run; add plot_b64 if older schema is detected."""
+    with sqlite3.connect(DB_PATH) as c:
+        c.execute(
+            """CREATE TABLE IF NOT EXISTS runs (
+                   id          TEXT PRIMARY KEY,
+                   filename    TEXT,
+                   created_at  TEXT,
+                   p50         REAL,
+                   p95         REAL,
+                   p99         REAL,
+                   stdev       REAL,
+                   count       INTEGER,
+                   approved    INTEGER DEFAULT 0,
+                   approved_by TEXT,
+                   approved_at TEXT,
+                   plot_b64    TEXT
+               );"""
+        )
+        # Older DBs may lack plot_b64
+        try:
+            c.execute("ALTER TABLE runs ADD COLUMN plot_b64 TEXT;")
+        except sqlite3.OperationalError:
+            pass  # already present
+
+def _row_to_dict(row: t.Tuple) -> dict:
+    keys = ("id","filename","created_at","p50","p95","p99","stdev","count",
+            "approved","approved_by","approved_at","plot_b64")
+    return dict(zip(keys,row))
+
+_init_db()
+
+# ── CSV ingestion (called on every request; inexpensive) ─────────────────────
+def _ingest_new_files() -> None:
+    with sqlite3.connect(DB_PATH) as c:
+        known = {row[0] for row in c.execute("SELECT id FROM runs")}
+    for csv_path in CSV_DIR.glob("*.csv"):
+        run_id = csv_path.stem                      # e.g. 20250805_091105
+        if run_id in known:
+            continue
+
+        # 1 Read CSV, reorder by ingress_timestamp_ns
+        df = pd.read_csv(csv_path,
+                         names=["idx","ingress","egress","latency_ns"],
+                         header=0)
+        df.sort_values("ingress", inplace=True)
+        lat = df["latency_ns"]
+
+        # 2 Stats
+        p50, p95, p99 = (lat.quantile(q) for q in (0.50,0.95,0.99))
+        stdev = statistics.pstdev(lat)
+
+        # 3 Plot → base64 PNG
+        fig, ax = plt.subplots()
+        ax.plot(df["ingress"], lat, linewidth=0.5)
+        ax.set_xlabel("Ingress timestamp (ns)")
+        ax.set_ylabel("Latency (ns)")
+        ax.set_title(f"Latency trace – run {run_id}")
+        buf = io.BytesIO(); fig.savefig(buf, format="png", dpi=120,
+                                        bbox_inches="tight"); plt.close(fig)
+        plot_b64 = base64.b64encode(buf.getvalue()).decode()
+
+        # 4 Insert row
+        with sqlite3.connect(DB_PATH) as c:
+            c.execute("""INSERT INTO runs VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                      (run_id, csv_path.name, dt.datetime.utcnow().isoformat(),
+                       p50, p95, p99, stdev, len(lat),
+                       0, None, None, plot_b64))
+        print("[INFO] ingested", csv_path.name)
+
+# ── Middleware: auto‑ingest before each request ──────────────────────────────
+@app.middleware("http")
+async def auto_ingest(request: Request, call_next):
+    _ingest_new_files()
+    return await call_next(request)
+
+# ── Routes ───────────────────────────────────────────────────────────────────
+@app.get("/", response_class=HTMLResponse)
+def list_runs(request: Request):
+    with sqlite3.connect(DB_PATH) as c:
+        rows = c.execute("SELECT * FROM runs ORDER BY created_at DESC").fetchall()
+    return templates.TemplateResponse("list.html",
+        {"request": request, "runs": [_row_to_dict(r) for r in rows]})
+
+@app.get("/approved", response_class=HTMLResponse)
+def approved_runs(request: Request):
+    with sqlite3.connect(DB_PATH) as c:
+        rows = c.execute("""SELECT * FROM runs
+                            WHERE approved=1 ORDER BY created_at DESC""").fetchall()
+    return templates.TemplateResponse("list.html",
+        {"request": request, "runs": [_row_to_dict(r) for r in rows]})
+
+@app.get("/runs/latest")
+def latest_redirect():
+    with sqlite3.connect(DB_PATH) as c:
+        row = c.execute("SELECT id FROM runs ORDER BY created_at DESC LIMIT 1").fetchone()
+    if not row:
+        raise HTTPException(404, "no runs yet")
+    return RedirectResponse(f"/runs/{row[0]}", status_code=303)
+
+@app.get("/runs/{run_id}", response_class=HTMLResponse)
+def show_run(request: Request, run_id: str):
+    with sqlite3.connect(DB_PATH) as c:
+        row = c.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+    if not row:
+        raise HTTPException(404)
+    return templates.TemplateResponse("detail.html",
+        {"request": request, **_row_to_dict(row)})
+
+@app.post("/runs/{run_id}/approve")
+def approve(run_id: str, user: str = Form("anon")):
+    now = dt.datetime.utcnow().isoformat()
+    with sqlite3.connect(DB_PATH) as c:
+        changed = c.execute("""UPDATE runs
+                               SET approved=1, approved_by=?, approved_at=?
+                               WHERE id=? AND approved=0""",
+                             (user, now, run_id)).rowcount
+    if changed == 0:
+        raise HTTPException(409, "already approved or not found")
+    return RedirectResponse(f"/runs/{run_id}", status_code=303)
+
+@app.get("/runs/{run_id}/status")
+def status(run_id: str):
+    with sqlite3.connect(DB_PATH) as c:
+        row = c.execute("SELECT approved FROM runs WHERE id=?", (run_id,)).fetchone()
+    if not row:
+        raise HTTPException(404)
+    return {"run_id": run_id, "approved": bool(row[0])}
+
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# /apps/sp_hfts/latency_portal/templates/list.html
+# ──────────────────────────────────────────────────────────────────────────────
+<!DOCTYPE html><html><body>
+<h2>Latency Benchmarks</h2>
+
+<p>
+  <a href="/">All runs</a> |
+  <a href="/approved">Approved only</a>
+</p>
+
+<table border="1" cellpadding="6">
+<tr><th>Run</th><th>UTC</th><th>P50</th><th>P95</th><th>P99</th>
+    <th>σ</th><th>n</th><th>Approved?</th></tr>
+{% for r in runs %}
+<tr>
+  <td><a href="/runs/{{ r.id }}">{{ r.id }}</a></td>
+  <td>{{ r.created_at[:19] }}</td>
+  <td>{{ '%.1f'|format(r.p50) }}</td>
+  <td>{{ '%.1f'|format(r.p95) }}</td>
+  <td>{{ '%.1f'|format(r.p99) }}</td>
+  <td>{{ '%.1f'|format(r.stdev) }}</td>
+  <td>{{ r.count }}</td>
+  <td style="color:{{'green' if r.approved else 'red'}};">
+      {{ '✓' if r.approved else '✗' }}
+  </td>
+</tr>
+{% endfor %}
+</table>
+
+<p><a href="/runs/latest">Go to latest →</a></p>
+</body></html>
+
+# ──────────────────────────────────────────────────────────────────────────────
+# /apps/sp_hfts/latency_portal/templates/detail.html
+# ──────────────────────────────────────────────────────────────────────────────
+<!DOCTYPE html><html><body>
+<h3>Run {{ id }} &nbsp; ({{ created_at[:19] }} UTC)</h3>
+
+<img src="data:image/png;base64,{{ plot_b64 }}" alt="latency plot"><br><br>
+
+<ul>
+  <li><b>P50:</b> {{ '%.1f'|format(p50) }}</li>
+  <li><b>P95:</b> {{ '%.1f'|format(p95) }}</li>
+  <li><b>P99:</b> {{ '%.1f'|format(p99) }}</li>
+  <li><b>σ:</b>   {{ '%.1f'|format(stdev) }}</li>
+  <li><b>Samples:</b> {{ count }}</li>
+  <li><b>Status:</b>
+    {% if approved %}
+      <span style="color:green">APPROVED by {{ approved_by }}
+        ({{ approved_at[:19] }})</span>
+    {% else %}
+      <span style="color:red">PENDING</span>
+    {% endif %}
+  </li>
+</ul>
+
+{% if not approved %}
+<form action="/runs/{{ id }}/approve" method="post">
+  Name: <input name="user" value="">
+  <button>Approve</button>
+</form>
+{% endif %}
+
+<p><a href="/">← back</a></p>
+</body></html>
+
+# ──────────────────────────────────────────────────────────────────────────────
+# /etc/systemd/system/latency-portal.service
+# ──────────────────────────────────────────────────────────────────────────────
+[Unit]
+Description=Latency approval portal
+After=network.target
+
+[Service]
+User=sp_hfts
+Group=sp_hfts
+WorkingDirectory=/apps/sp_hfts/latency_portal
+Environment="PATH=/apps/sp_hfts/latency_portal/.venv/bin"
+ExecStart=/apps/sp_hfts/latency_portal/.venv/bin/uvicorn main:app \
+          --host 0.0.0.0 --port 8080
+Restart=on-failure
+LimitNOFILE=4096
+
+[Install]
+WantedBy=multi-user.target
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Snippet for run_benchmark.py (end of file) – stage CSV on 593d
+# ──────────────────────────────────────────────────────────────────────────────
+# After PME results are produced on 593d:
+cap_ssh.run(f"mkdir -p /apps/sp_hfts/latency_csv && "
+            f"cp -f /apps/sp_hfts/pme/output/gtadtest_results.csv "
+            f"/apps/sp_hfts/latency_csv/{tag}.csv")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# .gitlab-ci.yml (relevant job)
+# ──────────────────────────────────────────────────────────────────────────────
+stages: [latency]
+
+latency_check:
+  stage: latency
+  image: python:3.12-slim
+  script: |
+    set -e
+    export TAG="$(date +%Y%m%d_%H%M%S)"
+    PORTAL="http://nyzls593d:8080"
+
+    # If latest run is already approved, exit 0.
+    if curl -sf "${PORTAL}/runs/latest" >/dev/null; then
+      LATEST=$(curl -s "${PORTAL}/runs/latest" -L | grep -oP '(?<=Run )[0-9_]{15}')
+      if [ -n "$LATEST" ]; then
+        APPROVED=$(curl -s "${PORTAL}/runs/$LATEST/status" | jq -r '.approved')
+        if [ "$APPROVED" = "true" ]; then
+          echo "Latest run $LATEST already approved – nothing to do."
+          exit 0
+        fi
+      fi
+    fi
+
+    # Otherwise run benchmark and fail intentionally.
+    echo "No approved benchmark found – running a new one …"
+    python3 run_benchmark.py --sim-config sim.yaml
+    echo "------------------------------------------------------------------"
+    echo "Benchmark finished but NOT YET APPROVED."
+    echo "Visit ${PORTAL}/runs/latest, review the trace, click 'Approve',"
+    echo "then retry this job from GitLab UI."
+    echo "------------------------------------------------------------------"
+    exit 1
+  allow_failure: false
+  retry: 0
+  artifacts:
+    when: always
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Documentation
+# ──────────────────────────────────────────────────────────────────────────────
+1. **Directory convention**  
+   `run_benchmark.py` copies its PME‑generated CSV to  
+   `/apps/sp_hfts/latency_csv/<TIMESTAMP>.csv` on *nyzls593d*.  
+   The portal watches this folder; no network upload is required.
+
+2. **Service deployment**  
+   ```bash
+   python3 -m venv /apps/sp_hfts/latency_portal/.venv
+   source /apps/sp_hfts/latency_portal/.venv/bin/activate
+   pip install fastapi "uvicorn[standard]" pandas jinja2 matplotlib
+   sudo systemctl daemon-reload
+   sudo systemctl enable --now latency-portal
+Database schema
+SQLite table runs contains statistics, approval info, and the
+base‑64 encoded PNG plot (plot_b64). Schema upgrades are handled on
+start‑up.
+
+Web UI
+
+/ – list of all runs (newest first)
+
+/approved – only approved runs (historical baselines)
+
+/runs/latest – redirect to the most recent run
+
+/runs/<id> – detail page with stats, plot, approval button
+
+/runs/<id>/status – JSON {approved: bool} for CI polling
+
+CI pipeline behaviour
+
+First execution of latency_check will run the benchmark, print
+the review URL, and fail (exit 1).
+
+The reviewer approves in the portal then clicks Retry on the same
+GitLab job; the job detects the approval and passes without
+re‑running the benchmark.
+
+Plot generation
+Matplotlib (headless “Agg” backend) renders a lightweight PNG of
+latency_ns vs ingress_timestamp_ns. The image is embedded directly
+with a data: URI—no separate static file handling required.
+
+Security
+Internal host only. For external exposure add Nginx with TLS and basic
+auth or integrate GitLab OAuth (not shown).
+
+Extensibility
+
+Add histogram plots, SLA auto‑checks, or switch to Postgres by
+extending the ingestion function.
+
+Grafana can be pointed at the SQLite or a Parquet export if richer
+dashboards are desired later.
