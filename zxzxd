@@ -1,0 +1,414 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# 1.  latency_portal.py     (put in /apps/sp_hfts/latency_portal/)
+# ──────────────────────────────────────────────────────────────────────────────
+#!/usr/bin/env python3
+"""
+latency‑portal  ◆  nano‑latency visualiser
+-------------------------------------------------
+• Runs with ordinary user privileges (no systemd or root).
+• Watches `/apps/sp_hfts/latency_csv/*.csv`
+• Parses   entry_id, ingress_timestamp_ns, egress_timestamp_ns, latency_ns
+• Sorts    by ingress_timestamp_ns (ascending)
+• Stores   aggregate stats + fallback PNG in SQLite
+• UI:      Bootstrap 5 + Plotly + DataTables
+• Extra:   /logs route shows the last N lines of the portal log
+"""
+
+import base64, io, json, logging, pathlib, sqlite3, statistics, datetime as dt
+from typing import List
+
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")               # headless
+import matplotlib.pyplot as plt
+
+from fastapi import FastAPI, Request, HTTPException, Form
+from fastapi.responses import HTMLResponse, RedirectResponse, PlainTextResponse
+from fastapi.templating import Jinja2Templates
+
+# ─────────────────────────── Config & paths ──────────────────────────────────
+CSV_DIR   = pathlib.Path("/apps/sp_hfts/latency_csv")
+CSV_DIR.mkdir(parents=True, exist_ok=True)
+
+BASE_DIR  = pathlib.Path(__file__).parent
+LOG_FILE  = BASE_DIR / "portal.log"
+
+DB_PATH   = str(CSV_DIR / "runs.db")      # plain string for sqlite3
+TPL_DIR   = BASE_DIR / "templates"
+
+# ─────────────────────────── Logging setup ───────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_FILE, encoding="utf-8"),
+        logging.StreamHandler()
+    ],
+)
+log = logging.getLogger("latency-portal")
+
+# ─────────────────────────── FastAPI & templates ─────────────────────────────
+app       = FastAPI(title="Latency‑Portal")
+templates = Jinja2Templates(directory=str(TPL_DIR))
+
+# ─────────────────────────── DB helpers ──────────────────────────────────────
+def _init_db() -> None:
+    with sqlite3.connect(DB_PATH) as c:
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS runs(
+            id          TEXT PRIMARY KEY,
+            filename    TEXT,
+            created_at  TEXT,
+            p50         REAL,
+            p95         REAL,
+            p99         REAL,
+            stdev       REAL,
+            count       INTEGER,
+            approved    INTEGER DEFAULT 0,
+            approved_by TEXT,
+            approved_at TEXT,
+            png_b64     TEXT
+        );""")
+
+def _row_to_dict(row) -> dict:
+    keys = ("id","filename","created_at","p50","p95","p99","stdev","count",
+            "approved","approved_by","approved_at","png_b64")
+    return dict(zip(keys,row))
+
+_init_db()
+
+# ─────────────────────────── CSV ingestion ───────────────────────────────────
+def _ingest_new_files() -> None:
+    """Scan CSV_DIR and ingest any new file that is not yet in DB."""
+    with sqlite3.connect(DB_PATH) as c:
+        known = {r[0] for r in c.execute("SELECT id FROM runs")}
+    for csv_path in CSV_DIR.glob("*.csv"):
+        run_id = csv_path.stem
+        if run_id in known:
+            continue
+
+        try:
+            df = pd.read_csv(
+                csv_path,
+                skipinitialspace=True,           # trims spaces after commas
+                names=["entry_id","ingress","egress","latency_ns"],
+                header=0,
+                dtype={"entry_id":"Int64","ingress":"int64",
+                       "egress":"int64","latency_ns":"int64"},
+                engine="python"                 # tolerant parser
+            )
+        except Exception as exc:
+            log.error("Failed to parse %s: %s", csv_path.name, exc)
+            continue
+
+        if df.empty or "ingress" not in df.columns:
+            log.error("Empty or malformed CSV: %s", csv_path.name)
+            continue
+
+        df.sort_values("ingress", inplace=True)
+        lat = df["latency_ns"]
+
+        # Top-level stats
+        p50, p95, p99 = (lat.quantile(q) for q in (0.50,0.95,0.99))
+        stdev = statistics.pstdev(lat)
+
+        # Static tiny PNG (email / fallback)
+        fig, ax = plt.subplots()
+        ax.plot(df["ingress"], lat, linewidth=0.5)
+        ax.set_xlabel("Ingress ns"); ax.set_ylabel("Latency ns")
+        ax.set_title(f"Run {run_id}")
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", dpi=110, bbox_inches="tight")
+        plt.close(fig)
+        png_b64 = base64.b64encode(buf.getvalue()).decode()
+
+        with sqlite3.connect(DB_PATH) as c:
+            c.execute("""INSERT INTO runs VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                      (run_id, csv_path.name, dt.datetime.utcnow().isoformat(),
+                       p50, p95, p99, stdev, len(lat),
+                       0, None, None, png_b64))
+        log.info("Ingested %s", csv_path.name)
+
+# ─────────────────────────── Auto‑ingest middleware ──────────────────────────
+@app.middleware("http")
+async def auto_ingest(request: Request, call_next):
+    _ingest_new_files()
+    return await call_next(request)
+
+# ─────────────────────────── Helper – per‑second stats ───────────────────────
+def _per_second_quantiles(df) -> tuple[List[int], List[float], List[float], List[float]]:
+    """Return epoch‑seconds array and P50/P95/P99 lists."""
+    df["sec"] = (df["ingress"] // 1_000_000_000)
+    grouped   = df.groupby("sec")["latency_ns"]
+    p50 = grouped.quantile(0.50)
+    p95 = grouped.quantile(0.95)
+    p99 = grouped.quantile(0.99)
+    secs = p50.index.astype(int).tolist()
+    return secs, p50.tolist(), p95.tolist(), p99.tolist()
+
+# ─────────────────────────── Routes ──────────────────────────────────────────
+@app.get("/", response_class=HTMLResponse)
+def list_runs(request: Request):
+    with sqlite3.connect(DB_PATH) as c:
+        rows = c.execute("SELECT * FROM runs ORDER BY created_at DESC").fetchall()
+    return templates.TemplateResponse("list.html",
+        {"request": request, "runs":[_row_to_dict(r) for r in rows]})
+
+@app.get("/approved", response_class=HTMLResponse)
+def approved(request: Request):
+    with sqlite3.connect(DB_PATH) as c:
+        rows = c.execute("""SELECT * FROM runs
+                            WHERE approved=1 ORDER BY created_at DESC""").fetchall()
+    return templates.TemplateResponse("list.html",
+        {"request": request, "runs":[_row_to_dict(r) for r in rows]})
+
+@app.get("/runs/latest")
+def latest_redirect():
+    with sqlite3.connect(DB_PATH) as c:
+        row = c.execute("SELECT id FROM runs ORDER BY created_at DESC LIMIT 1").fetchone()
+    if not row: raise HTTPException(404, "No runs yet")
+    return RedirectResponse(f"/runs/{row[0]}", status_code=303)
+
+@app.get("/runs/{run_id}", response_class=HTMLResponse)
+def show_run(request: Request, run_id: str):
+    with sqlite3.connect(DB_PATH) as c:
+        row = c.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+    if not row: raise HTTPException(404)
+    d = _row_to_dict(row)
+
+    csv_path = CSV_DIR / d["filename"]
+    if not csv_path.exists():
+        raise HTTPException(500, "CSV file not found on disk")
+
+    df = pd.read_csv(
+        csv_path,
+        skipinitialspace=True,
+        names=["entry_id","ingress","egress","latency_ns"],
+        header=0,
+        dtype={"entry_id":"Int64","ingress":"int64",
+               "egress":"int64","latency_ns":"int64"},
+        engine="python"
+    ).sort_values("ingress")
+
+    # Raw trace arrays
+    x_json = json.dumps(df["ingress"].tolist())
+    y_json = json.dumps(df["latency_ns"].tolist())
+
+    # Per‑second quantile arrays
+    secs, p50s, p95s, p99s = _per_second_quantiles(df)
+    sec_json  = json.dumps(secs)
+    p50_json  = json.dumps(p50s)
+    p95_json  = json.dumps(p95s)
+    p99_json  = json.dumps(p99s)
+
+    return templates.TemplateResponse("detail.html",
+        {"request": request, **d,
+         "x_json": x_json, "y_json": y_json,
+         "sec_json": sec_json, "p50_json": p50_json,
+         "p95_json": p95_json, "p99_json": p99_json})
+
+@app.post("/runs/{run_id}/approve")
+def approve(run_id: str, user: str = Form("anon")):
+    now = dt.datetime.utcnow().isoformat()
+    with sqlite3.connect(DB_PATH) as c:
+        changed = c.execute("""UPDATE runs
+                               SET approved=1, approved_by=?, approved_at=?
+                               WHERE id=? AND approved=0""",
+                             (user, now, run_id)).rowcount
+    if changed == 0:
+        raise HTTPException(409, "already approved or not found")
+    return RedirectResponse(f"/runs/{run_id}", status_code=303)
+
+@app.get("/runs/{run_id}/status")
+def status(run_id: str):
+    with sqlite3.connect(DB_PATH) as c:
+        row = c.execute("SELECT approved FROM runs WHERE id=?", (run_id,)).fetchone()
+    if not row: raise HTTPException(404)
+    return {"run_id": run_id, "approved": bool(row[0])}
+
+@app.get("/logs", response_class=PlainTextResponse)
+def view_logs(lines: int = 1000):
+    """Download last N lines of server log (default 1000)."""
+    try:
+        with open(LOG_FILE, "r", encoding="utf-8") as f:
+            tail = f.readlines()[-lines:]
+    except FileNotFoundError:
+        return PlainTextResponse("Log file not found.", status_code=404)
+    return PlainTextResponse("".join(tail))
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 2.  templates/base.html
+# ──────────────────────────────────────────────────────────────────────────────
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>{% block title %}Latency Portal{% endblock %}</title>
+
+  <!-- Bootstrap 5 -->
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css"
+        rel="stylesheet">
+
+  <!-- DataTables -->
+  <link href="https://cdn.datatables.net/1.13.6/css/dataTables.bootstrap5.min.css"
+        rel="stylesheet">
+
+  <!-- Plotly -->
+  <script src="https://cdn.plot.ly/plotly-2.32.0.min.js"></script>
+
+  <!-- jQuery + DataTables JS -->
+  <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
+  <script src="https://cdn.datatables.net/1.13.6/js/jquery.dataTables.min.js"></script>
+  <script src="https://cdn.datatables.net/1.13.6/js/dataTables.bootstrap5.min.js"></script>
+</head>
+<body class="p-4">
+<nav class="mb-4">
+  <a class="btn btn-outline-secondary btn-sm me-2" href="/">Home</a>
+  <a class="btn btn-outline-secondary btn-sm me-2" href="/approved">Approved</a>
+  <a class="btn btn-outline-secondary btn-sm" href="/logs">Logs</a>
+</nav>
+
+{% block content %}{% endblock %}
+</body>
+</html>
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 3.  templates/list.html
+# ──────────────────────────────────────────────────────────────────────────────
+{% extends 'base.html' %}
+
+{% block title %}Latency Benchmarks{% endblock %}
+
+{% block content %}
+<h2 class="mb-3">Latency Benchmarks</h2>
+
+<table id="runs-table" class="table table-striped table-bordered table-sm">
+<thead class="table-light">
+<tr>
+  <th>Run</th><th>UTC</th><th>P50 (ns)</th><th>P95 (ns)</th><th>P99 (ns)</th>
+  <th>σ (ns)</th><th>n</th><th>Status</th>
+</tr>
+</thead>
+<tbody>
+{% for r in runs %}
+<tr>
+  <td><a href="/runs/{{ r.id }}">{{ r.id }}</a></td>
+  <td>{{ r.created_at[:19] }}</td>
+  <td>{{ '%.0f'|format(r.p50) }}</td>
+  <td>{{ '%.0f'|format(r.p95) }}</td>
+  <td>{{ '%.0f'|format(r.p99) }}</td>
+  <td>{{ '%.0f'|format(r.stdev) }}</td>
+  <td>{{ r.count }}</td>
+  <td>
+    {% if r.approved %}
+      <span class="badge bg-success">APPROVED</span>
+    {% else %}
+      <span class="badge bg-danger">PENDING</span>
+    {% endif %}
+  </td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+
+<script>
+$(function () { $('#runs-table').DataTable({order:[[1,'desc']]}); });
+</script>
+{% endblock %}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 4.  templates/detail.html
+# ──────────────────────────────────────────────────────────────────────────────
+{% extends 'base.html' %}
+{% block title %}Run {{ id }}{% endblock %}
+
+{% block content %}
+<a class="btn btn-link mb-3" href="/">← Back</a>
+
+<h3>Run {{ id }}</h3>
+<p class="text-muted">{{ created_at[:19] }} UTC</p>
+
+<!-- Raw latency trace -->
+<div id="rawplot" style="height:350px;"></div>
+
+<!-- Per‑second quantiles -->
+<div id="quantplot" style="height:350px;" class="mt-5"></div>
+
+<script>
+const rawX = {{ x_json|safe }};
+const rawY = {{ y_json|safe }};
+Plotly.newPlot('rawplot', [{
+  x: rawX, y: rawY, mode:'lines', line:{width:1}
+}], {
+  title: 'Latency per message',
+  margin:{l:40,r:20,t:40,b:40},
+  xaxis:{title:'Ingress timestamp (ns)'},
+  yaxis:{title:'Latency (ns)'}
+});
+
+const secX  = {{ sec_json|safe }};
+const p50Y  = {{ p50_json|safe }};
+const p95Y  = {{ p95_json|safe }};
+const p99Y  = {{ p99_json|safe }};
+Plotly.newPlot('quantplot', [
+  {x:secX, y:p50Y, name:'P50', mode:'lines'},
+  {x:secX, y:p95Y, name:'P95', mode:'lines'},
+  {x:secX, y:p99Y, name:'P99', mode:'lines'}
+], {
+  title: 'Per‑second quantiles',
+  margin:{l:40,r:20,t:40,b:40},
+  xaxis:{title:'Epoch second'},
+  yaxis:{title:'Latency (ns)'}
+});
+</script>
+
+<div class="row g-3 mt-4">
+  <div class="col-auto"><span class="badge bg-secondary">P50</span> {{ '%.0f'|format(p50) }} ns</div>
+  <div class="col-auto"><span class="badge bg-secondary">P95</span> {{ '%.0f'|format(p95) }} ns</div>
+  <div class="col-auto"><span class="badge bg-secondary">P99</span> {{ '%.0f'|format(p99) }} ns</div>
+  <div class="col-auto"><span class="badge bg-secondary">σ</span>   {{ '%.0f'|format(stdev) }} ns</div>
+  <div class="col-auto"><span class="badge bg-secondary">n</span>   {{ count }}</div>
+</div>
+
+{% if approved %}
+  <div class="alert alert-success mt-4">
+    Approved by <b>{{ approved_by }}</b> at {{ approved_at[:19] }} UTC
+  </div>
+{% else %}
+  <form class="mt-4" action="/runs/{{ id }}/approve" method="post">
+    <div class="input-group w-auto">
+      <input class="form-control form-control-sm" name="user"
+             placeholder="Your name">
+      <button class="btn btn-success btn-sm">Approve</button>
+    </div>
+  </form>
+{% endif %}
+{% endblock %}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 5.  start_portal.sh   (unchanged except explicit host)
+# ──────────────────────────────────────────────────────────────────────────────
+#!/usr/bin/env bash
+set -euo pipefail
+DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$DIR"
+
+if [ ! -d ".venv" ]; then
+  python3 -m venv .venv
+  .venv/bin/pip install --upgrade pip
+  .venv/bin/pip install fastapi "uvicorn[standard]" pandas jinja2 \
+                                matplotlib plotly
+fi
+
+# kill stale server if any
+pkill -f "uvicorn .*latency_portal:app" || true
+
+nohup .venv/bin/python -m uvicorn latency_portal:app \
+      --host 0.0.0.0 --port 8080 \
+      >>portal.log 2>&1 &
+
+echo "Latency‑portal running on http://$(hostname -f):8080"
+# ──────────────────────────────────────────────────────────────────────────────
