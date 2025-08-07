@@ -1,0 +1,376 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# /apps/sp_hfts/latency_portal/latency_portal.py   (FULL FILE)
+# ──────────────────────────────────────────────────────────────────────────────
+#!/usr/bin/env python3
+"""
+latency-portal – analytics + baseline comparison
+• Metrics: P50/95/99, σ, tail-index α, peak-EWMA
+• Plots:  raw trace + EWMA, per-second quantiles, tail CCDF
+• Baseline overlay & colour-coded deltas
+• Robust NaN / None handling
+"""
+
+import base64, io, json, logging, pathlib, sqlite3, datetime as dt
+from typing import List, Tuple, Optional
+
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+from fastapi import FastAPI, Request, HTTPException, Form, Query
+from fastapi.responses import HTMLResponse, RedirectResponse, PlainTextResponse
+from fastapi.templating import Jinja2Templates
+
+# ───────── paths & logging ───────────────────────────────────────────────────
+CSV_DIR  = pathlib.Path("/apps/sp_hfts/latency_csv"); CSV_DIR.mkdir(parents=True, exist_ok=True)
+APP_DIR  = pathlib.Path(__file__).parent
+LOG_FILE = APP_DIR / "portal.log"
+DB_PATH  = str(CSV_DIR / "runs.db")
+TPL_DIR  = APP_DIR / "templates"
+
+logging.basicConfig(level=logging.INFO,
+    format="%(asctime)s  %(levelname)-7s %(message)s",
+    handlers=[logging.FileHandler(LOG_FILE, encoding="utf-8"),
+              logging.StreamHandler()])
+log = logging.getLogger("latency-portal")
+
+# ───────── FastAPI ───────────────────────────────────────────────────────────
+app = FastAPI(title="Latency-Portal")
+templates = Jinja2Templates(directory=str(TPL_DIR))
+
+# ───────── DB schema ─────────────────────────────────────────────────────────
+def _init_db():
+    with sqlite3.connect(DB_PATH) as c:
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS runs(
+            id TEXT PRIMARY KEY, filename TEXT, created_at TEXT,
+            p50 REAL, p95 REAL, p99 REAL, stdev REAL, count INTEGER,
+            alpha REAL, max_ewma REAL,
+            approved INTEGER DEFAULT 0, approved_by TEXT, approved_at TEXT,
+            png_b64 TEXT
+        );""")
+        for col in ("alpha REAL", "max_ewma REAL"):
+            try: c.execute(f"ALTER TABLE runs ADD COLUMN {col.split()[0]} {col.split()[1]};")
+            except sqlite3.OperationalError: pass
+_init_db()
+
+def _row_to_dict(row):
+    keys=("id","filename","created_at","p50","p95","p99","stdev","count",
+          "alpha","max_ewma","approved","approved_by","approved_at","png_b64")
+    return dict(zip(keys,row))
+
+# ───────── helpers ───────────────────────────────────────────────────────────
+def _tail_index(lat: np.ndarray) -> float:
+    if len(lat) < 200: return float("nan")
+    lat_sorted = np.sort(lat)
+    tail = lat_sorted[int(0.995 * len(lat_sorted)):]
+    prob = 1.0 - np.arange(1, len(tail)+1) / len(lat_sorted)
+    slope,_ = np.polyfit(np.log(tail), np.log(prob), 1)
+    return -slope
+
+def _ewma(series: pd.Series, alpha=0.2):
+    return series.ewm(alpha=alpha).mean()
+
+def _per_sec_quantiles(df) -> Tuple[List[str], List[float], List[float], List[float]]:
+    df["sec"] = df["ingress"] // 1_000_000_000
+    g = df.groupby("sec")["latency_ns"]
+    p50, p95, p99 = (g.quantile(q) for q in (0.5, 0.95, 0.99))
+    ts = pd.to_datetime(p50.index.astype("int64"), unit="s", utc=True)\
+           .strftime("%Y-%m-%dT%H:%M:%SZ").tolist()
+    return ts, p50.tolist(), p95.tolist(), p99.tolist()
+
+def _ccdf(lat_sorted: np.ndarray) -> Tuple[List[float], List[float]]:
+    n = len(lat_sorted)
+    prob = 1.0 - (np.arange(1, n+1) / n)
+    return lat_sorted.tolist(), prob.tolist()
+
+def _safe_num(x):  # convert str/None/NaN -> None
+    return float(x) if isinstance(x, (int, float)) and x == x else None
+
+def _safe_diff(a, b):
+    return (_safe_num(a) - _safe_num(b)) if _safe_num(a) is not None and _safe_num(b) is not None else None
+
+# ───────── ingestion ─────────────────────────────────────────────────────────
+def _ingest_new_files():
+    with sqlite3.connect(DB_PATH) as c:
+        known = {r[0] for r in c.execute("SELECT id FROM runs")}
+    for csv in CSV_DIR.glob("*.csv"):
+        tag = csv.stem
+        if tag in known: continue
+        try:
+            df = pd.read_csv(csv, header=0, skipinitialspace=True,
+                 names=["entry_id","ingress","egress","latency_ns"],
+                 dtype={"ingress":"int64","latency_ns":"int64"}, engine="python")
+        except Exception as exc:
+            log.error("parse %s: %s", csv.name, exc); continue
+        if df.empty: continue
+        df.sort_values("ingress", inplace=True)
+        lat = df["latency_ns"].to_numpy()
+        p50,p95,p99 = (np.quantile(lat,q) for q in (0.5,0.95,0.99))
+        stdev = float(np.std(lat, ddof=0))
+        alpha = _tail_index(lat)
+        max_ewma = float(_ewma(df["latency_ns"]).max())
+
+        # tiny PNG preview
+        fig, ax = plt.subplots(); ax.plot(df["ingress"], lat, linewidth=0.5)
+        buf = io.BytesIO(); fig.savefig(buf, format="png", dpi=100, bbox_inches="tight")
+        plt.close(fig); png_b64 = base64.b64encode(buf.getvalue()).decode()
+
+        with sqlite3.connect(DB_PATH) as c:
+            c.execute("""INSERT INTO runs VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (tag, csv.name, dt.datetime.utcnow().isoformat(),
+                 p50, p95, p99, stdev, len(lat), alpha, max_ewma,
+                 0, None, None, png_b64))
+        log.info("ingested %s", csv.name)
+
+@app.middleware("http")
+async def auto_ingest(req, call_next):
+    _ingest_new_files()
+    return await call_next(req)
+
+# ───────── baseline helpers ──────────────────────────────────────────────────
+def _recent_ids(limit=20):
+    with sqlite3.connect(DB_PATH) as c:
+        return [r[0] for r in c.execute("SELECT id FROM runs ORDER BY created_at DESC LIMIT ?", (limit,))]
+
+def _pick_baseline(cur_id:str, explicit:Optional[str]):
+    with sqlite3.connect(DB_PATH) as c:
+        if explicit:
+            r=c.execute("SELECT * FROM runs WHERE id=?", (explicit,)).fetchone()
+            return _row_to_dict(r) if r and explicit!=cur_id else None
+        r=c.execute("SELECT * FROM runs WHERE approved=1 AND id<>? ORDER BY created_at DESC LIMIT 1", (cur_id,)).fetchone()
+        if r: return _row_to_dict(r)
+        r=c.execute("SELECT * FROM runs WHERE id<>? ORDER BY created_at DESC LIMIT 1", (cur_id,)).fetchone()
+        return _row_to_dict(r) if r else None
+
+# ───────── routes ────────────────────────────────────────────────────────────
+@app.get("/", response_class=HTMLResponse)
+def index(request:Request):
+    with sqlite3.connect(DB_PATH) as c:
+        rows=c.execute("SELECT * FROM runs ORDER BY created_at DESC").fetchall()
+    return templates.TemplateResponse("list.html", {"request":request,"runs":[_row_to_dict(r) for r in rows]})
+
+@app.get("/runs/{run_id}", response_class=HTMLResponse)
+def run_page(request:Request, run_id:str, baseline:Optional[str]=Query(None)):
+    with sqlite3.connect(DB_PATH) as c:
+        cur_row=c.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+    if not cur_row: raise HTTPException(404)
+    cur=_row_to_dict(cur_row)
+
+    df_cur = pd.read_csv(CSV_DIR/cur["filename"], header=0, names=["entry_id","ingress","egress","latency_ns"],
+             skipinitialspace=True, dtype={"ingress":"int64","latency_ns":"int64"}, engine="python")\
+             .sort_values("ingress")
+    df_cur["ingress_dt"]=pd.to_datetime(df_cur["ingress"],unit="ns",utc=True)
+    x_cur=json.dumps(df_cur["ingress_dt"].dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ").tolist())
+    y_cur=json.dumps(df_cur["latency_ns"].tolist())
+    ewma_cur=json.dumps(_ewma(df_cur["latency_ns"]).tolist())
+    sec_cur,p50c,p95c,p99c=_per_sec_quantiles(df_cur)
+    ccdf_cur=json.dumps(_ccdf(np.sort(df_cur["latency_ns"].to_numpy())))
+
+    base=_pick_baseline(run_id, baseline)
+    if base:
+        df_b=pd.read_csv(CSV_DIR/base["filename"], header=0, names=["entry_id","ingress","egress","latency_ns"],
+               skipinitialspace=True, dtype={"ingress":"int64","latency_ns":"int64"}, engine="python")\
+               .sort_values("ingress")
+        sec_b,p50b,p95b,p99b=_per_sec_quantiles(df_b)
+        ccdf_b=json.dumps(_ccdf(np.sort(df_b["latency_ns"].to_numpy())))
+        base_info={"id":base["id"],"sec":json.dumps(sec_b),
+                   "p50":json.dumps(p50b),"p95":json.dumps(p95b),"p99":json.dumps(p99b),
+                   "ccdf":ccdf_b,"alpha":base["alpha"],"max_ewma":base["max_ewma"]}
+    else:
+        base_info=None
+
+    delta_keys=("p50","p95","p99","stdev","alpha","max_ewma")
+    delta={k:_safe_diff(cur.get(k), base.get(k) if base_info else None) for k in delta_keys}
+
+    return templates.TemplateResponse("detail.html", {
+        "request":request, **cur,
+        "x_cur":x_cur,"y_cur":y_cur,"ewma_cur":ewma_cur,
+        "sec_cur":json.dumps(sec_cur),"p50c":json.dumps(p50c),
+        "p95c":json.dumps(p95c),"p99c":json.dumps(p99c),
+        "ccdf_cur":ccdf_cur,
+        "baseline":base_info,"delta":delta,"recent_ids":_recent_ids()})
+
+# --------- approve / unapprove / status / logs endpoints --------------------
+@app.post("/runs/{run_id}/approve")
+def approve(run_id:str, user:str=Form("anon")):
+    ts=dt.datetime.utcnow().isoformat()
+    with sqlite3.connect(DB_PATH) as c:
+        n=c.execute("UPDATE runs SET approved=1,approved_by=?,approved_at=? WHERE id=? AND approved=0",
+                    (user,ts,run_id)).rowcount
+    if n==0: raise HTTPException(409,"already approved or not found")
+    return RedirectResponse(f"/runs/{run_id}",303)
+
+@app.post("/runs/{run_id}/unapprove")
+def unapprove(run_id:str):
+    with sqlite3.connect(DB_PATH) as c:
+        n=c.execute("UPDATE runs SET approved=0,approved_by=NULL,approved_at=NULL WHERE id=? AND approved=1",
+                    (run_id,)).rowcount
+    if n==0: raise HTTPException(409,"not approved or not found")
+    return RedirectResponse(f"/runs/{run_id}",303)
+
+@app.get("/runs/{run_id}/status")
+def status(run_id:str):
+    with sqlite3.connect(DB_PATH) as c:
+        r=c.execute("SELECT approved FROM runs WHERE id=?", (run_id,)).fetchone()
+    if not r: raise HTTPException(404)
+    return {"run_id":run_id,"approved":bool(r[0])}
+
+@app.get("/logs", response_class=PlainTextResponse)
+def logs(lines:int=1000):
+    try:
+        with open(LOG_FILE,"r",encoding="utf-8") as f:
+            return PlainTextResponse("".join(f.readlines()[-lines:]))
+    except FileNotFoundError:
+        raise HTTPException(404,"log missing")
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# /apps/sp_hfts/latency_portal/templates/base.html  (unchanged, shown for ref)
+# ──────────────────────────────────────────────────────────────────────────────
+<!DOCTYPE html><html><head>
+  <meta charset="utf-8">
+  <title>{% block title %}Latency Portal{% endblock %}</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+  <link href="https://cdn.datatables.net/1.13.6/css/dataTables.bootstrap5.min.css" rel="stylesheet">
+  <script src="https://cdn.plot.ly/plotly-2.32.0.min.js"></script>
+  <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
+  <script src="https://cdn.datatables.net/1.13.6/js/jquery.dataTables.min.js"></script>
+  <script src="https://cdn.datatables.net/1.13.6/js/dataTables.bootstrap5.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+  <script>document.addEventListener('DOMContentLoaded',()=>{[...document.querySelectorAll('[data-bs-toggle="tooltip"]')]
+    .forEach(el=>new bootstrap.Tooltip(el));});</script>
+</head><body class="p-4">
+<nav class="mb-4">
+  <a class="btn btn-outline-secondary btn-sm me-2" href="/">Home</a>
+  <a class="btn btn-outline-secondary btn-sm me-2" href="/logs">Logs</a>
+</nav>
+{% block content %}{% endblock %}
+</body></html>
+
+# ──────────────────────────────────────────────────────────────────────────────
+# /apps/sp_hfts/latency_portal/templates/list.html  (unchanged)
+# ──────────────────────────────────────────────────────────────────────────────
+{% extends 'base.html' %}{% block title %}Latency Benchmarks{% endblock %}
+{% block content %}
+<h2 class="mb-3">Latency Benchmarks</h2>
+<table id="runs" class="table table-striped table-bordered table-sm">
+<thead class="table-light"><tr>
+  <th>Run</th><th>UTC</th><th>P50</th><th>P95</th><th>P99</th><th>σ</th>
+  <th>n</th><th>Status</th></tr></thead><tbody>
+{% for r in runs %}
+<tr>
+  <td><a href="/runs/{{ r.id }}">{{ r.id }}</a></td>
+  <td>{{ r.created_at[:19] }}</td>
+  <td>{{ '%.0f'|format(r.p50) }}</td>
+  <td>{{ '%.0f'|format(r.p95) }}</td>
+  <td>{{ '%.0f'|format(r.p99) }}</td>
+  <td>{{ '%.0f'|format(r.stdev) }}</td>
+  <td>{{ r.count }}</td>
+  <td>{% if r.approved %}<span class="badge bg-success">APPROVED</span>
+      {% else %}<span class="badge bg-danger">PENDING</span>{% endif %}</td>
+</tr>{% endfor %}
+</tbody></table>
+<script>$(function(){$('#runs').DataTable({order:[[1,'desc']]});});</script>
+{% endblock %}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# /apps/sp_hfts/latency_portal/templates/detail.html  (FULL FILE, robust)
+# ──────────────────────────────────────────────────────────────────────────────
+{% extends 'base.html' %}
+{% block title %}Run {{ id }}{% endblock %}
+{% macro fmtn(val, fmt) -%}
+  {% if val is not none and val == val %}{{ fmt|format(val) }}{% else %}–{% endif %}
+{%- endmacro %}
+{% macro delta_cell(val) -%}
+  {% if val is not none and val == val %}
+    <td style="color:{{ 'green' if val<0 else ('red' if val>0 else 'black') }}">
+      {{ fmtn(val, '%+.1f') }}
+    </td>
+  {% else %}<td>–</td>{% endif %}
+{%- endmacro %}
+{% block content %}
+<a class="btn btn-link mb-3" href="/">← Back</a>
+<h3>Run {{ id }}</h3>
+<p class="text-muted">{{ created_at[:19] }} UTC</p>
+
+<form class="mb-3" method="get">
+  <label class="form-label me-2">Compare with:</label>
+  <select name="baseline" class="form-select form-select-sm w-auto d-inline-block"
+          onchange="this.form.submit()">
+    <option value="" {% if not baseline %}selected{% endif %}>auto</option>
+    {% for rid in recent_ids %}
+      <option value="{{ rid }}" {% if baseline and rid==baseline.id %}selected{% endif %}>{{ rid }}</option>
+    {% endfor %}
+  </select>
+  <noscript><button class="btn btn-sm btn-primary">Go</button></noscript>
+</form>
+
+<div id="rawplot" style="height:350px;"></div>
+<div id="quantplot" style="height:350px;" class="mt-5"></div>
+<div id="tailplot" style="height:350px;" class="mt-5"></div>
+
+<script>
+const xCur={{ x_cur|safe }}, yCur={{ y_cur|safe }}, ewma={{ ewma_cur|safe }};
+Plotly.newPlot('rawplot', [
+  {x:xCur,y:yCur,name:'latency',mode:'lines',line:{width:1}},
+  {x:xCur,y:ewma,name:'EWMA 0.2',mode:'lines',line:{dash:'dot',width:1,color:'#ff7f0e'}}
+], {title:'Per-message latency',xaxis:{type:'date'},yaxis:{title:'ns'},margin:{l:40,r:20,t:40,b:40}});
+
+Plotly.newPlot('quantplot', [
+  {x:{{ sec_cur|safe }},y:{{ p50c|safe }},name:'P50',mode:'lines'},
+  {x:{{ sec_cur|safe }},y:{{ p95c|safe }},name:'P95',mode:'lines'},
+  {x:{{ sec_cur|safe }},y:{{ p99c|safe }},name:'P99',mode:'lines'},
+  {% if baseline %}
+  {x:{{ baseline.sec|safe }},y:{{ baseline.p50|safe }},name:'P50 base',mode:'lines',line:{dash:'dash'}},
+  {x:{{ baseline.sec|safe }},y:{{ baseline.p95|safe }},name:'P95 base',mode:'lines',line:{dash:'dash'}},
+  {x:{{ baseline.sec|safe }},y:{{ baseline.p99|safe }},name:'P99 base',mode:'lines',line:{dash:'dash'}},
+  {% endif %}
+], {title:'Per-second quantiles',xaxis:{type:'date'},yaxis:{title:'ns'},margin:{l:40,r:20,t:40,b:40}});
+
+const ccdf={{ ccdf_cur|safe }};
+let tail=[{x:ccdf[0],y:ccdf[1],mode:'lines',name:'current',line:{width:1}}];
+{% if baseline %}
+  const ccdfB={{ baseline.ccdf|safe }};
+  tail.push({x:ccdfB[0],y:ccdfB[1],mode:'lines',name:'baseline',line:{dash:'dash'}});
+{% endif %}
+Plotly.newPlot('tailplot', tail, {title:'Tail CCDF',xaxis:{type:'log'},yaxis:{type:'log'},margin:{l:40,r:20,t:40,b:40}} );
+</script>
+
+<table class="table table-sm w-auto mt-4">
+<thead class="table-light"><tr>
+  <th>Metric</th><th>Current</th>
+  {% if baseline %}<th>Baseline<br><small>{{ baseline.id }}</small></th><th>Δ</th>{% endif %}
+</tr></thead><tbody>
+<tr><td>P50 (ns)</td><td>{{ fmtn(p50,'%.0f') }}</td>
+    {% if baseline %}<td>{{ fmtn(baseline.p50,'%.0f') }}</td>{{ delta_cell(delta.p50) }}{% endif %}</tr>
+<tr><td>P95 (ns)</td><td>{{ fmtn(p95,'%.0f') }}</td>
+    {% if baseline %}<td>{{ fmtn(baseline.p95,'%.0f') }}</td>{{ delta_cell(delta.p95) }}{% endif %}</tr>
+<tr><td>P99 (ns)</td><td>{{ fmtn(p99,'%.0f') }}</td>
+    {% if baseline %}<td>{{ fmtn(baseline.p99,'%.0f') }}</td>{{ delta_cell(delta.p99) }}{% endif %}</tr>
+<tr><td>σ (ns)</td><td>{{ fmtn(stdev,'%.0f') }}</td>
+    {% if baseline %}<td>{{ fmtn(baseline.stdev,'%.0f') }}</td>{{ delta_cell(delta.stdev) }}{% endif %}</tr>
+<tr><td>Tail α</td><td>{{ fmtn(alpha,'%.2f') }}</td>
+    {% if baseline %}<td>{{ fmtn(baseline.alpha,'%.2f') }}</td>{{ delta_cell(delta.alpha) }}{% endif %}</tr>
+<tr><td>Peak EWMA (ns)</td><td>{{ fmtn(max_ewma,'%.0f') }}</td>
+    {% if baseline %}<td>{{ fmtn(baseline.max_ewma,'%.0f') }}</td>{{ delta_cell(delta.max_ewma) }}{% endif %}</tr>
+<tr><td>n</td><td>{{ count }}</td>{% if baseline %}<td>{{ baseline.count }}</td><td>–</td>{% endif %}</tr>
+</tbody></table>
+
+{% if approved %}
+  <div class="alert alert-success mt-4 d-flex justify-content-between">
+    <span>Approved by <b>{{ approved_by }}</b> at {{ approved_at[:19] }} UTC</span>
+    <form action="/runs/{{ id }}/unapprove" method="post"><button class="btn btn-outline-danger btn-sm">Un-approve</button></form>
+  </div>
+{% else %}
+  <form class="mt-4" action="/runs/{{ id }}/approve" method="post">
+    <div class="input-group w-auto"><input class="form-control form-control-sm" name="user" placeholder="Your name">
+      <button class="btn btn-success btn-sm">Approve</button></div>
+  </form>
+{% endif %}
+{% endblock %}
+# ──────────────────────────────────────────────────────────────────────────────
