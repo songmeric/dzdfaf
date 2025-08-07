@@ -1,0 +1,72 @@
+graph TB
+    subgraph "Input Layer"
+        PCAP[PCAP Files<br/>.pcap/.pcapng]
+        DC[Dropcopy Files<br/>Latency Stats]
+        CFG[YAML Config<br/>Flow Definitions]
+    end
+
+    subgraph "Core Engine"
+        ENG[Engine<br/>Main Coordinator]
+        FW[File Watcher<br/>Directory Monitor]
+        WQ[Work Queue<br/>PCAP Processing Queue]
+    end
+
+    subgraph "Packet Processing Pipeline"
+        PP[PacketProcessor<br/>PCAP Reader & Orchestrator]
+        FC[FlowClassifier<br/>Flow Matching Engine]
+        TR[TCP Reassembly<br/>Stream Reconstruction]
+        RB[RingBuffer<br/>Lock-free SPSC Buffer]
+    end
+
+    subgraph "Protocol Handlers"
+        PHF[ProtocolHandlerFactory<br/>Handler Creation]
+        IPH[IProtocolHandler<br/>Interface]
+        SPV3[SpcastV3Handler<br/>SPCAST Protocol]
+        RH[RazeHandler<br/>RAZE Protocol]
+    end
+
+    subgraph "Data Processing"
+        DCH[DropcopyHandler<br/>Latency Stats Parser]
+        MSG[Message Parser<br/>Extract Join Keys]
+        JE[Join Engine<br/>Match Ingress/Egress]
+    end
+
+    subgraph "Output Layer"
+        OFW[OutputFileWriter<br/>CSV Generator]
+        CSV[CSV Results<br/>Latency Measurements]
+    end
+
+    PCAP --> FW
+    CFG --> ENG
+    DC --> DCH
+    
+    FW --> WQ
+    WQ --> ENG
+    ENG --> PP
+    
+    PP --> FC
+    PP --> TR
+    TR --> RB
+    RB --> PHF
+    
+    FC -->|Classify Packets| PP
+    PHF --> IPH
+    IPH --> SPV3
+    IPH --> RH
+    
+    SPV3 --> MSG
+    RH --> MSG
+    DCH --> RH
+    
+    MSG -->|Ingress Messages| JE
+    MSG -->|Egress Messages| JE
+    
+    JE -->|Joined Messages| OFW
+    OFW --> CSV
+    
+    ENG -->|Orchestrate| OFW
+
+    style ENG fill:#4CAF50,stroke:#2E7D32,stroke-width:3px,color:#fff
+    style PP fill:#2196F3,stroke:#1565C0,stroke-width:2px,color:#fff
+    style FC fill:#FF9800,stroke:#E65100,stroke-width:2px,color:#fff
+    style JE fill:#9C27B0,stroke:#6A1B9A,stroke-width:2px,color:#fff
