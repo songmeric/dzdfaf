@@ -1,0 +1,98 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# latency_portal.py    ◆  drop-in fix for None/str delta bug
+# ──────────────────────────────────────────────────────────────────────────────
+#!/usr/bin/env python3
+# [all previous imports & code are unchanged up to the delta section …]
+
+# … inside run_page() just BEFORE the `return templates.TemplateResponse` call:
+
+    # ---------- robust delta dict (avoids TypeError) ----------
+    def _safe_num(x):
+        return x if isinstance(x, (int, float)) else None
+    delta_keys = ("p50", "p95", "p99", "stdev", "alpha", "max_ewma")
+    delta = {k: (_safe_num(cur.get(k)) - _safe_num(base[k]))
+             if base and _safe_num(cur.get(k)) is not None and _safe_num(base[k]) is not None
+             else None
+             for k in delta_keys}
+
+    return templates.TemplateResponse("detail.html", {
+        #           ↓ keep everything else identical ↓
+        "request": request, **cur,
+        "x_cur": x_cur, "y_cur": y_cur, "ewma_cur": ewma_cur,
+        "sec_cur": json.dumps(sec_cur),
+        "p50c": json.dumps(p50c), "p95c": json.dumps(p95c), "p99c": json.dumps(p99c),
+        "ccdf_cur": ccdf_cur,
+        "baseline": base_info,
+        "delta": delta,
+        "recent_ids": _recent_ids()
+    })
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# templates/detail.html   ◆  safer number formatting
+# ──────────────────────────────────────────────────────────────────────────────
+{% extends 'base.html' %}
+{% block title %}Run {{ id }}{% endblock %}
+{% macro fmtnum(val, pattern) -%}
+  {% if val is not none and val == val %}
+    {{ pattern|format(val) }}
+  {% else %}
+    –
+  {% endif %}
+{%- endmacro %}
+{% macro cell_delta(val) -%}
+  {% if val is not none and val == val %}
+    <td style="color:{{ 'green' if val<0 else ('red' if val>0 else 'black') }}">
+      {{ fmtnum(val, '%+.1f') }}
+    </td>
+  {% else %}
+    <td>–</td>
+  {% endif %}
+{%- endmacro %}
+
+{% block content %}
+<!-- (all the top of the page remains unchanged) -->
+
+<!-- stats table (replaced rows use macros) -->
+<table class="table table-sm w-auto mt-4">
+<thead class="table-light"><tr>
+  <th>Metric</th><th>Current</th>
+  {% if baseline %}<th>Baseline<br><small>{{ baseline.id }}</small></th><th>Δ</th>{% endif %}
+</tr></thead><tbody>
+<tr><td>P50 (ns)</td>
+    <td>{{ fmtnum(p50, '%.0f') }}</td>
+    {% if baseline %}
+      <td>{{ fmtnum(baseline.alpha is defined and baseline.p50, '%.0f') }}</td>
+      {{ cell_delta(delta.p50) }}
+    {% endif %}
+</tr>
+<tr><td>P95 (ns)</td>
+    <td>{{ fmtnum(p95, '%.0f') }}</td>
+    {% if baseline %}<td>{{ fmtnum(baseline.p95, '%.0f') }}</td>{{ cell_delta(delta.p95) }}{% endif %}
+</tr>
+<tr><td>P99 (ns)</td>
+    <td>{{ fmtnum(p99, '%.0f') }}</td>
+    {% if baseline %}<td>{{ fmtnum(baseline.p99, '%.0f') }}</td>{{ cell_delta(delta.p99) }}{% endif %}
+</tr>
+<tr><td>σ (ns)</td>
+    <td>{{ fmtnum(stdev, '%.0f') }}</td>
+    {% if baseline %}<td>{{ fmtnum(baseline.stdev, '%.0f') }}</td>{{ cell_delta(delta.stdev) }}{% endif %}
+</tr>
+<tr><td>Tail α</td>
+    <td>{{ fmtnum(alpha, '%.2f') }}</td>
+    {% if baseline %}<td>{{ fmtnum(baseline.alpha, '%.2f') }}</td>{{ cell_delta(delta.alpha) }}{% endif %}
+</tr>
+<tr><td>Peak EWMA (ns)</td>
+    <td>{{ fmtnum(max_ewma, '%.0f') }}</td>
+    {% if baseline %}<td>{{ fmtnum(baseline.max_ewma, '%.0f') }}</td>{{ cell_delta(delta.max_ewma) }}{% endif %}
+</tr>
+<tr><td>n</td><td>{{ count }}</td>
+    {% if baseline %}<td>{{ baseline.count }}</td><td>–</td>{% endif %}
+</tr>
+</tbody></table>
+
+<!-- (rest of page unchanged: plots & approve/unapprove) -->
+{% endblock %}
+# ──────────────────────────────────────────────────────────────────────────────
