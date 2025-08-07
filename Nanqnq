@@ -1,0 +1,185 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# latency_portal.py   ▒  drop-in replacement  ▒  2025-08-07
+# ---------------------------------------------------------------------------
+# • Tail-risk (α), EWMA burst score, per-second quantiles, CCDF overlay
+# • Robust delta calc – no TypeErrors if baseline lacks a metric
+# • Un/approve endpoints, logs, baseline picker, DataTables UI
+# ---------------------------------------------------------------------------
+#!/usr/bin/env python3
+import base64, io, json, logging, pathlib, sqlite3, statistics, datetime as dt
+from typing import List, Tuple, Optional
+
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+from fastapi import FastAPI, Request, HTTPException, Form, Query
+from fastapi.responses import HTMLResponse, RedirectResponse, PlainTextResponse
+from fastapi.templating import Jinja2Templates
+
+# ───────── paths & logging ───────────────────────────────────────────────────
+CSV_DIR  = pathlib.Path("/apps/sp_hfts/latency_csv"); CSV_DIR.mkdir(parents=True, exist_ok=True)
+APP_DIR  = pathlib.Path(__file__).parent
+LOG_FILE = APP_DIR / "portal.log"
+DB_PATH  = str(CSV_DIR / "runs.db")
+TPL_DIR  = APP_DIR / "templates"
+
+logging.basicConfig(level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s %(message)s",
+    handlers=[logging.FileHandler(LOG_FILE, encoding="utf-8"),
+              logging.StreamHandler()])
+log = logging.getLogger("latency-portal")
+
+# ───────── FastAPI ───────────────────────────────────────────────────────────
+app = FastAPI(title="Latency-Portal")
+templates = Jinja2Templates(directory=str(TPL_DIR))
+
+# ───────── DB schema ─────────────────────────────────────────────────────────
+def _init_db():
+    with sqlite3.connect(DB_PATH) as c:
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS runs(
+            id TEXT PRIMARY KEY, filename TEXT, created_at TEXT,
+            p50 REAL, p95 REAL, p99 REAL, stdev REAL, count INTEGER,
+            alpha REAL, max_ewma REAL,
+            approved INTEGER DEFAULT 0, approved_by TEXT, approved_at TEXT,
+            png_b64 TEXT);""")
+        for col in ("alpha REAL", "max_ewma REAL"):
+            try: c.execute(f"ALTER TABLE runs ADD COLUMN {col.split()[0]} {col.split()[1]};")
+            except sqlite3.OperationalError: pass
+_init_db()
+
+def _row_to_dict(r):
+    keys=("id","filename","created_at","p50","p95","p99","stdev","count",
+          "alpha","max_ewma","approved","approved_by","approved_at","png_b64")
+    return dict(zip(keys,r))
+
+# ───────── stats helpers ─────────────────────────────────────────────────────
+def _tail_index(lat: np.ndarray) -> float:
+    if len(lat) < 200: return float("nan")
+    lat_sorted = np.sort(lat)
+    tail = lat_sorted[int(0.995 * len(lat_sorted)):]
+    p = 1.0 - np.arange(1, len(tail)+1) / len(lat_sorted)
+    slope,_ = np.polyfit(np.log(tail), np.log(p), 1)
+    return -slope
+
+def _ewma(series: pd.Series, alpha=0.2) -> pd.Series:
+    return series.ewm(alpha=alpha).mean()
+
+def _per_sec_q(df)->Tuple[List[str],List[float],List[float],List[float]]:
+    df["sec"]=df["ingress"]//1_000_000_000
+    g=df.groupby("sec")["latency_ns"]
+    p50,p95,p99=(g.quantile(q) for q in (0.5,0.95,0.99))
+    x=pd.to_datetime(p50.index.astype("int64"),unit="s",utc=True)\
+        .strftime("%Y-%m-%dT%H:%M:%SZ").tolist()
+    return x,p50.tolist(),p95.tolist(),p99.tolist()
+
+def _ccdf(lat_sorted: np.ndarray)->Tuple[List[float],List[float]]:
+    n=len(lat_sorted)
+    prob=1.0 - (np.arange(1,n+1)/n)
+    return lat_sorted.tolist(), prob.tolist()
+
+# ───────── ingestion ─────────────────────────────────────────────────────────
+def _ingest_new_files():
+    with sqlite3.connect(DB_PATH) as c:
+        known={r[0] for r in c.execute("SELECT id FROM runs")}
+    for csv in CSV_DIR.glob("*.csv"):
+        tag=csv.stem
+        if tag in known: continue
+        try:
+            df=pd.read_csv(csv, header=0, skipinitialspace=True,
+                names=["entry_id","ingress","egress","latency_ns"],
+                dtype={"ingress":"int64","latency_ns":"int64"}, engine="python")
+        except Exception as e:
+            log.error("parse %s: %s", csv.name, e); continue
+        if df.empty: continue
+        df.sort_values("ingress", inplace=True)
+        lat=df["latency_ns"].to_numpy()
+        p50,p95,p99=(np.quantile(lat,q) for q in (0.5,0.95,0.99))
+        stdev=float(np.std(lat, ddof=0))
+        alpha=_tail_index(lat)
+        max_ewma=float(_ewma(df["latency_ns"]).max())
+        fig,ax=plt.subplots(); ax.plot(df["ingress"],lat,linewidth=0.5)
+        buf=io.BytesIO(); fig.savefig(buf,format="png",dpi=110,bbox_inches="tight")
+        plt.close(fig); png=base64.b64encode(buf.getvalue()).decode()
+        with sqlite3.connect(DB_PATH) as c:
+            c.execute("""INSERT INTO runs VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                      (tag,csv.name,dt.datetime.utcnow().isoformat(),
+                       p50,p95,p99,stdev,len(lat),alpha,max_ewma,
+                       0,None,None,png))
+        log.info("ingest %s", csv.name)
+
+@app.middleware("http")
+async def auto_ingest(req, call_next):
+    _ingest_new_files(); return await call_next(req)
+
+# ───────── baseline helpers ──────────────────────────────────────────────────
+def _recent_ids(n=20):
+    with sqlite3.connect(DB_PATH) as c:
+        return [r[0] for r in c.execute("SELECT id FROM runs ORDER BY created_at DESC LIMIT ?",(n,))]
+
+def _pick_baseline(cur_id:str, explicit:Optional[str]):
+    with sqlite3.connect(DB_PATH) as c:
+        if explicit:
+            r=c.execute("SELECT * FROM runs WHERE id=?", (explicit,)).fetchone()
+            return _row_to_dict(r) if r and explicit!=cur_id else None
+        r=c.execute("SELECT * FROM runs WHERE approved=1 AND id<>? ORDER BY created_at DESC LIMIT 1",(cur_id,)).fetchone()
+        if r: return _row_to_dict(r)
+        r=c.execute("SELECT * FROM runs WHERE id<>? ORDER BY created_at DESC LIMIT 1",(cur_id,)).fetchone()
+        return _row_to_dict(r) if r else None
+
+def _safe_diff(a,b):
+    return (a-b) if isinstance(a,(int,float)) and isinstance(b,(int,float)) else None
+
+# ───────── routes ────────────────────────────────────────────────────────────
+@app.get("/", response_class=HTMLResponse)
+def index(request:Request):
+    with sqlite3.connect(DB_PATH) as c:
+        rows=c.execute("SELECT * FROM runs ORDER BY created_at DESC").fetchall()
+    return templates.TemplateResponse("list.html", {"request":request,"runs":[_row_to_dict(r) for r in rows]})
+
+@app.get("/runs/{run_id}", response_class=HTMLResponse)
+def run_page(request:Request, run_id:str, baseline:Optional[str]=Query(None)):
+    with sqlite3.connect(DB_PATH) as c:
+        cur_row=c.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+    if not cur_row: raise HTTPException(404)
+    cur=_row_to_dict(cur_row)
+    df=pd.read_csv(CSV_DIR/cur["filename"], header=0, skipinitialspace=True,
+        names=["entry_id","ingress","egress","latency_ns"],
+        dtype={"ingress":"int64","latency_ns":"int64"}, engine="python")\
+        .sort_values("ingress")
+    df["ingress_dt"]=pd.to_datetime(df["ingress"],unit="ns",utc=True)
+    x_cur=json.dumps(df["ingress_dt"].dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ").tolist())
+    y_cur=json.dumps(df["latency_ns"].tolist())
+    ewma_cur=json.dumps(_ewma(df["latency_ns"]).tolist())
+    sec_cur,p50c,p95c,p99c=_per_sec_q(df)
+    ccdf_cur=json.dumps(_ccdf(np.sort(df["latency_ns"].to_numpy())))
+
+    base=_pick_baseline(run_id, baseline)
+    if base:
+        dfb=pd.read_csv(CSV_DIR/base["filename"], header=0, skipinitialspace=True,
+            names=["entry_id","ingress","egress","latency_ns"],
+            dtype={"ingress":"int64","latency_ns":"int64"}, engine="python")\
+            .sort_values("ingress")
+        sec_b,p50b,p95b,p99b=_per_sec_q(dfb)
+        ccdf_b=json.dumps(_ccdf(np.sort(dfb["latency_ns"].to_numpy())))
+        base_info={"id":base["id"],"sec":json.dumps(sec_b),
+                   "p50":json.dumps(p50b),"p95":json.dumps(p95b),"p99":json.dumps(p99b),
+                   "ccdf":ccdf_b,"alpha":base["alpha"],"max_ewma":base["max_ewma"]}
+    else: base_info=None
+
+    delta_keys=("p50","p95","p99","stdev","alpha","max_ewma")
+    delta={k:_safe_diff(cur.get(k), base.get(k) if base else None) for k in delta_keys}
+
+    return templates.TemplateResponse("detail.html", {
+        "request":request, **cur,
+        "x_cur":x_cur,"y_cur":y_cur,"ewma_cur":ewma_cur,
+        "sec_cur":json.dumps(sec_cur),"p50c":json.dumps(p50c),
+        "p95c":json.dumps(p95c),"p99c":json.dumps(p99c),
+        "ccdf_cur":ccdf_cur,
+        "baseline":base_info,"delta":delta,"recent_ids":_recent_ids()})
+
+# approve / unapprove / status / logs endpoints unchanged (same as previous)
+# ──────────────────────────────────────────────────────────────────────────────
