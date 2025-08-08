@@ -853,6 +853,8 @@ detail.html
     Plotly.react('cdfplot', data, makeLayoutXY('Latency distribution (CDF, filtered)','Latency (ns)','Cumulative (%)'));
     const note = document.getElementById('cdfNote');
     note.textContent = `Filter=${FILTER_MODE_DEFAULT}. Baseline overlay uses the same filter.`;
+    document.getElementById('toggleBaselineCDF').addEventListener('change', renderCDF);
+
   }
 
   // ---------- Quantiles & Raw (render on first tab show for sizing)
