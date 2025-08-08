@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
 latency-portal  ◆  nano-latency visualiser
-• Added: un-approve endpoint, ISO-date x-axes, tooltip-ready stats.
-• Now also supports: baseline comparison, CDF plots, robust stats, delta tables.
+• Added earlier: un-approve endpoint, ISO-date x-axes, tooltip-ready stats.
+• Now: baseline comparison (server-rendered dropdown & auto-select), CDF plot,
+       robust stats (p99.9, MADn, IQR, outlier rate) + compare deltas table.
 """
 
 import base64, io, json, logging, pathlib, sqlite3, statistics, datetime as dt
@@ -49,7 +50,7 @@ def _row_to_dict(row) -> dict:
           "approved","approved_by","approved_at","png_b64")
     return dict(zip(keys,row))
 
-# ─── CSV ingestion ───────────────────────────────────────────────────────────
+# ─── CSV ingestion (unchanged) ───────────────────────────────────────────────
 def _ingest_new_files() -> None:
     with sqlite3.connect(DB_PATH) as c:
         known = {r[0] for r in c.execute("SELECT id FROM runs")}
@@ -153,6 +154,20 @@ def _find_default_baseline_id(current_id: str) -> Optional[str]:
                          ORDER BY created_at DESC LIMIT 1""", (created_at,)).fetchone()
         return r[0] if r else None
 
+def _baseline_candidates(current_created_at: str, limit:int=100) -> List[dict]:
+    """All earlier runs to populate the dropdown (server-rendered)."""
+    with sqlite3.connect(DB_PATH) as c:
+        rows = c.execute(
+            """SELECT id,created_at,approved,p50,p95,p99,stdev,count
+               FROM runs
+               WHERE created_at < ?
+               ORDER BY created_at DESC
+               LIMIT ?""",
+            (current_created_at, int(limit))
+        ).fetchall()
+    keys=("id","created_at","approved","p50","p95","p99","stdev","count")
+    return [dict(zip(keys,r)) for r in rows]
+
 # ─── Routes ──────────────────────────────────────────────────────────────────
 @app.get("/", response_class=HTMLResponse)
 def list_runs(request: Request):
@@ -179,6 +194,8 @@ def show_run(request: Request, run_id:str):
         row=c.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
     if not row: raise HTTPException(404)
     d=_row_to_dict(row)
+
+    # Load CSV
     csv_path=CSV_DIR/d["filename"]
     if not csv_path.exists(): raise HTTPException(500,"CSV missing")
     df=pd.read_csv(csv_path, skipinitialspace=True,
@@ -196,14 +213,14 @@ def show_run(request: Request, run_id:str):
     # Robust stats (current run)
     stats = _summary_stats(df["latency_ns"])
 
-    # CDF for current run (no extra dependency, computed here)
+    # Current CDF (no numpy required)
     points = 300
-    ps = [(i+1)/(points+1) for i in range(points)]  # 0..1 (exclusive)
+    ps = [(i+1)/(points+1) for i in range(points)]
     qs = df["latency_ns"].quantile(ps).astype(float).tolist()
-    cdf_p_json = json.dumps(ps)
-    cdf_q_json = json.dumps(qs)
 
-    baseline_default = _find_default_baseline_id(run_id)
+    # Baseline: default + candidates (server-rendered dropdown)
+    baseline_default = _find_default_baseline_id(run_id) or ""
+    baseline_runs    = _baseline_candidates(d["created_at"], limit=100)
 
     return templates.TemplateResponse("detail.html",
         {"request":request, **d,
@@ -212,10 +229,11 @@ def show_run(request: Request, run_id:str):
          "p50_json":json.dumps(p50s),
          "p95_json":json.dumps(p95s),
          "p99_json":json.dumps(p99s),
-         "baseline_default": baseline_default or "",
+         "baseline_default": baseline_default,
+         "baseline_runs": baseline_runs,
          "stats_json": json.dumps(stats),
-         "cdf_p_json": cdf_p_json,
-         "cdf_q_json": cdf_q_json})
+         "cdf_p_json": json.dumps(ps),
+         "cdf_q_json": json.dumps(qs)})
 
 @app.post("/runs/{run_id}/approve")
 def approve(run_id:str, user:str=Form("anon")):
@@ -249,24 +267,6 @@ def view_logs(lines:int=1000):
     except FileNotFoundError: raise HTTPException(404,"log missing")
 
 # ─── Comparison & analysis JSON endpoints ────────────────────────────────────
-@app.get("/runs/options")
-def run_options(before_id: Optional[str]=None, limit:int=30):
-    """Return candidate baseline runs (earlier than `before_id` if provided)."""
-    cutoff = None
-    if before_id:
-        with sqlite3.connect(DB_PATH) as c:
-            row = c.execute("SELECT created_at FROM runs WHERE id=?", (before_id,)).fetchone()
-            if row: cutoff = row[0]
-    q = "SELECT id,created_at,approved,p50,p95,p99,stdev,count FROM runs"
-    params=[]
-    if cutoff:
-        q += " WHERE created_at < ?"; params=[cutoff]
-    q += " ORDER BY created_at DESC LIMIT ?"; params.append(int(limit))
-    with sqlite3.connect(DB_PATH) as c:
-        rows=c.execute(q, tuple(params)).fetchall()
-    keys=("id","created_at","approved","p50","p95","p99","stdev","count")
-    return {"runs":[dict(zip(keys,r)) for r in rows]}
-
 @app.get("/runs/{run_id}/per_second_json")
 def per_second_json(run_id:str):
     meta = _load_run_meta(run_id)
@@ -325,25 +325,35 @@ def compare_runs(run_id:str, baseline_id:str):
 
 
 
-
-
-
-
-
-
-
 {% extends 'base.html' %}{% block title %}Run {{ id }}{% endblock %}
 {% block content %}
 <a class="btn btn-link mb-3" href="/">← Back</a>
 <h3>Run {{ id }}</h3><p class="text-muted">{{ created_at[:19] }} UTC</p>
 
-<!-- Hidden data holder for JS (avoids JSON filter issues) -->
-<div id="page-data" data-run="{{ id }}" data-baseline="{{ baseline_default }}"></div>
-
+<!-- Plots -->
 <div id="rawplot" style="height:350px;"></div>
 <div id="quantplot" style="height:350px;" class="mt-5"></div>
 <div id="cdfplot" style="height:350px;" class="mt-5"></div>
 
+<!-- Approval-critical quick chips (original ones preserved) -->
+<div class="row g-3 mt-3">
+  <div class="col-auto"><span class="badge bg-secondary" data-bs-toggle="tooltip"
+        title="50 % of latencies are below this value (median)">P50</span>
+        {{ '%.0f'|format(p50) }} ns</div>
+  <div class="col-auto"><span class="badge bg-secondary" data-bs-toggle="tooltip"
+        title="95th percentile latency">P95</span>
+        {{ '%.0f'|format(p95) }} ns</div>
+  <div class="col-auto"><span class="badge bg-secondary" data-bs-toggle="tooltip"
+        title="99th percentile latency">P99</span>
+        {{ '%.0f'|format(p99) }} ns</div>
+  <div class="col-auto"><span class="badge bg-secondary" data-bs-toggle="tooltip"
+        title="Population standard deviation">σ</span>
+        {{ '%.0f'|format(stdev) }} ns</div>
+  <div class="col-auto"><span class="badge bg-secondary" data-bs-toggle="tooltip"
+        title="Total samples">n</span> {{ count }}</div>
+</div>
+
+<!-- Baseline compare -->
 <div class="card mt-4">
   <div class="card-body">
     <div class="row g-3 align-items-center">
@@ -351,16 +361,21 @@ def compare_runs(run_id:str, baseline_id:str):
         <label for="baselineSelect" class="col-form-label">Compare to (baseline):</label>
       </div>
       <div class="col-auto">
-        <select id="baselineSelect" class="form-select form-select-sm" style="min-width: 320px;">
-          <option value="">— none —</option>
+        <select id="baselineSelect" class="form-select form-select-sm" style="min-width: 360px;">
+          <option value="" {% if not baseline_default %}selected{% endif %}>— none —</option>
+          {% for r in baseline_runs %}
+            <option value="{{ r.id }}" {% if baseline_default and r.id == baseline_default %}selected{% endif %}>
+              {{ r.id }}  •  {{ r.created_at[:19] }} UTC{% if r.approved %} ✓{% endif %}
+            </option>
+          {% endfor %}
         </select>
       </div>
       <div class="col-auto form-check">
-        <input class="form-check-input" type="checkbox" id="toggleBaselineQuant" checked>
+        <input class="form-check-input" type="checkbox" id="toggleBaselineQuant" checked aria-label="Overlay baseline on per-second quantiles">
         <label class="form-check-label" for="toggleBaselineQuant">Overlay baseline on per-second quantiles</label>
       </div>
       <div class="col-auto form-check">
-        <input class="form-check-input" type="checkbox" id="toggleBaselineCDF" checked>
+        <input class="form-check-input" type="checkbox" id="toggleBaselineCDF" checked aria-label="Overlay baseline on CDF">
         <label class="form-check-label" for="toggleBaselineCDF">Overlay baseline on CDF</label>
       </div>
     </div>
@@ -375,11 +390,20 @@ def compare_runs(run_id:str, baseline_id:str):
   </div>
 </div>
 
-<!-- Current-run stats (always visible, no baseline needed) -->
+<!-- Current-run stats with explanations -->
 <div class="card mt-4">
   <div class="card-body">
     <h6 class="mb-3">Current run — robust stats</h6>
     <div class="row row-cols-2 row-cols-md-3 row-cols-lg-4 g-3" id="current-stats"></div>
+    <details class="mt-3">
+      <summary class="small text-muted">What do these mean?</summary>
+      <ul class="small mb-0">
+        <li><b>P99.9</b>: 99.9th percentile latency (captures ultra-tail).</li>
+        <li><b>MAD<span style="font-size:0.9em;vertical-align:super;">n</span></b>: robust σ ≈ 1.4826×MAD; less sensitive to outliers than standard deviation.</li>
+        <li><b>IQR</b>: Interquartile range (75th–25th percentile); dispersion of the bulk.</li>
+        <li><b>Outlier rate</b>: Share of samples with robust z-score &gt; 3.5 (Hampel filter proxy).</li>
+      </ul>
+    </details>
   </div>
 </div>
 
@@ -405,14 +429,10 @@ Plotly.newPlot('quantplot', [
   yaxis:{title:'Latency (ns)'}
 });
 
-// Precomputed CDF for current run (no fetch needed)
+// Precomputed CDF for current run
 const CURRENT_CDF = { p: {{ cdf_p_json|safe }}, q_ns: {{ cdf_q_json|safe }}, run_id: "{{ id }}" };
 
-// Helpers
-const pd = document.getElementById('page-data');
-const CURRENT_ID = pd.dataset.run;
-const BASELINE_DEFAULT = pd.dataset.baseline || null;
-
+// Formatters
 const fmtInt = (v)=> (v===null||v===undefined) ? '–' : Math.round(v).toLocaleString('en');
 const fmtNs  = (v)=> (v===null||v===undefined) ? '–' : Math.round(v).toLocaleString('en') + ' ns';
 const fmtPct = (v)=> (v===null||v===undefined) ? '–' : v.toFixed(2) + ' %';
@@ -436,7 +456,7 @@ const fmtPct = (v)=> (v===null||v===undefined) ? '–' : v.toFixed(2) + ' %';
   const s = {{ stats_json|safe }};
   const items = [
     {k:'p999',lbl:'P99.9',fmt:fmtNs, tip:'99.9th percentile'},
-    {k:'madn',lbl:'MAD\u2099',fmt:fmtNs, tip:'Robust σ (1.4826·MAD)'},
+    {k:'madn',lbl:'MAD\u2099',fmt:fmtNs, tip:'Robust σ ≈ 1.4826×MAD'},
     {k:'iqr', lbl:'IQR',  fmt:fmtNs, tip:'75th–25th percentile'},
     {k:'outlier_rate',lbl:'Outlier rate',fmt:(v)=>fmtPct(v*100), tip:'Robust z > 3.5'},
     {k:'mean',lbl:'Mean',fmt:fmtNs, tip:'Arithmetic mean'},
@@ -455,14 +475,13 @@ const fmtPct = (v)=> (v===null||v===undefined) ? '–' : v.toFixed(2) + ' %';
       </div>`;
     box.appendChild(div);
   });
-  // activate tooltips if not already
   if (window.bootstrap){
     [...document.querySelectorAll('[data-bs-toggle="tooltip"]')]
       .forEach(el=>new bootstrap.Tooltip(el));
   }
 })();
 
-// Baseline comparison UI
+// Baseline comparison
 (function(){
   let baselineCDF=null, baselineQuant=null;
   let quantBaselineTraceIdx = [];
@@ -507,7 +526,6 @@ const fmtPct = (v)=> (v===null||v===undefined) ? '–' : v.toFixed(2) + ' %';
   }
 
   function paintDeltaCell(td, metricKey, cur, base){
-    // lower is better for these:
     const lowerIsBetter = new Set(['p50','p95','p99','p999','stdev','madn','iqr','mean','outlier_rate']);
     const direction = (cur - base);
     const improved = lowerIsBetter.has(metricKey) ? (direction < 0) : (direction > 0);
@@ -521,7 +539,7 @@ const fmtPct = (v)=> (v===null||v===undefined) ? '–' : v.toFixed(2) + ' %';
     tbody.innerHTML = '';
     const baselineId = document.getElementById('baselineSelect').value;
     if (!baselineId){ return; }
-    const cmp = await (await fetch(`/runs/${CURRENT_ID}/compare?baseline_id=${baselineId}`)).json();
+    const cmp = await (await fetch(`/runs/{{ id }}/compare?baseline_id=${baselineId}`)).json();
     const rows = [
       {k:'p50', lbl:'P50', fmt:fmtNs},
       {k:'p95', lbl:'P95', fmt:fmtNs},
@@ -566,51 +584,22 @@ const fmtPct = (v)=> (v===null||v===undefined) ? '–' : v.toFixed(2) + ' %';
     updateCompareTable();
   }
 
+  // Wire UI
   document.getElementById('toggleBaselineQuant').addEventListener('change', ()=> {
     maybeOverlayQuantBaseline();
   });
   document.getElementById('toggleBaselineCDF').addEventListener('change', ()=> {
     renderCDF();
   });
+  document.getElementById('baselineSelect').addEventListener('change', (e)=> loadBaseline(e.target.value));
 
-  async function populateBaselineOptions(){
-    const res = await (await fetch(`/runs/options?before_id=${CURRENT_ID}&limit=50`)).json();
+  // Auto-load default baseline if present
+  (function initAutoBaseline(){
     const sel = document.getElementById('baselineSelect');
-    res.runs.forEach(r=>{
-      const label = `${r.id}  •  ${r.created_at.slice(0,19)} UTC  ${r.approved?'✓':''}`;
-      const opt = new Option(label, r.id);
-      sel.add(opt);
-    });
-    if (BASELINE_DEFAULT){
-      sel.value = BASELINE_DEFAULT;
-      sel.dispatchEvent(new Event('change'));
-    }
-  }
-
-  (async function init(){
-    await populateBaselineOptions();
-    renderCDF(); // no baseline yet
-    document.getElementById('baselineSelect').addEventListener('change', (e)=> loadBaseline(e.target.value));
+    if (sel && sel.value){ loadBaseline(sel.value); }
   })();
 })();
 </script>
-
-<div class="row g-3 mt-4">
-  <div class="col-auto"><span class="badge bg-secondary" data-bs-toggle="tooltip"
-        title="50 % of latencies are below this value (median)">P50</span>
-        {{ '%.0f'|format(p50) }} ns</div>
-  <div class="col-auto"><span class="badge bg-secondary" data-bs-toggle="tooltip"
-        title="95th percentile latency">P95</span>
-        {{ '%.0f'|format(p95) }} ns</div>
-  <div class="col-auto"><span class="badge bg-secondary" data-bs-toggle="tooltip"
-        title="99th percentile latency">P99</span>
-        {{ '%.0f'|format(p99) }} ns</div>
-  <div class="col-auto"><span class="badge bg-secondary" data-bs-toggle="tooltip"
-        title="Population standard deviation">σ</span>
-        {{ '%.0f'|format(stdev) }} ns</div>
-  <div class="col-auto"><span class="badge bg-secondary" data-bs-toggle="tooltip"
-        title="Total samples">n</span> {{ count }}</div>
-</div>
 
 {% if approved %}
   <div class="alert alert-success mt-4 d-flex justify-content-between">
@@ -629,3 +618,6 @@ const fmtPct = (v)=> (v===null||v===undefined) ? '–' : v.toFixed(2) + ' %';
   </form>
 {% endif %}
 {% endblock %}
+
+
+
