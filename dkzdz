@@ -1,16 +1,16 @@
-latency-portal.py
-
 #!/usr/bin/env python3
 """
-latency-portal  ◆  nano-latency visualiser
+latency-portal  ◆  tick‑to‑trade latency visualiser (HFT‑aware)
 
 What's new (engineer-friendly, SaaS-style):
+- Light mode only (removed dark mode)
 - Baseline comparison via CDF overlay (time-series overlay removed)
-- Clear delta chips with metric labels (Δ P50, Δ P95, Δ P99, Δ P99.9, Δ Outliers)
-- Plain-English interpretation guide with thresholds (configurable below)
-- "Stability & tail" rollups with simple wording (no stats jargon)
-- Dark mode support via base template
-- No extra dependencies
+- Delta chips use HFT-aware thresholds + significance gating
+- Optional data filtering (none/light/strict) for decision metrics
+- Exceedance vs baseline test (binomial z-score) to resist noise
+- Absolute-delta floors (ns / pp) to avoid tiny-but-large-% effects
+- Clear, HFT-specific interpretation guide
+- No auto-rejection: chips are advisory; human approves
 """
 
 import base64, io, json, logging, pathlib, sqlite3, statistics, datetime as dt
@@ -39,15 +39,23 @@ app       = FastAPI(title="Latency-Portal")
 templates = Jinja2Templates(directory=str(TPL_DIR))
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Interpretation thresholds (edit to fit your org)
+# HFT‑aware interpretation thresholds
 # unit: "pct" = percent change vs baseline; "pp" = percentage points
+# Added: min_abs_ns / min_pp to suppress tiny absolute deltas; z gates for persistence.
 INTERPRETATION_RULES = {
-    "p50":  {"warn": 10.0, "fail": 20.0, "unit": "pct", "label": "P50"},
-    "p95":  {"warn": 7.0,  "fail": 15.0, "unit": "pct", "label": "P95"},
-    "p99":  {"warn": 5.0,  "fail": 10.0, "unit": "pct", "label": "P99"},
-    "p999": {"warn": 3.0,  "fail": 6.0,  "unit": "pct", "label": "P99.9"},
-    # outlier_rate is measured as share ∈ [0,1], so deltas are in percentage points
-    "outlier_rate": {"warn": 0.5, "fail": 1.0, "unit": "pp", "label": "Outlier rate"},
+    "p50":  {"warn": 12.0, "fail": 25.0, "unit": "pct", "label": "P50",   "min_abs_ns": 50,  "z_warn": 2.5, "z_fail": 4.0},
+    "p95":  {"warn": 9.0,  "fail": 18.0, "unit": "pct", "label": "P95",   "min_abs_ns": 100, "z_warn": 2.5, "z_fail": 4.0},
+    "p99":  {"warn": 7.0,  "fail": 14.0, "unit": "pct", "label": "P99",   "min_abs_ns": 120, "z_warn": 2.5, "z_fail": 4.0},
+    "p999": {"warn": 5.0,  "fail": 10.0, "unit": "pct", "label": "P99.9", "min_abs_ns": 200, "z_warn": 2.5, "z_fail": 4.0},
+    # outlier_rate is measured as share ∈ [0,1]
+    "outlier_rate": {"warn": 0.5, "fail": 1.0, "unit": "pp", "label": "Outlier rate", "min_pp": 0.1}
+}
+# Default filter policy for metrics/CDF (raw plot always unfiltered)
+FILTER_DEFAULT = "light"
+FILTER_CONFIG = {
+    "none":   {"warmup_sec": 0.0, "clip_negative": True, "hard_max_ns": None, "robust_z_max": None},
+    "light":  {"warmup_sec": 0.30, "clip_negative": True, "hard_max_ns": None, "robust_z_max": None},
+    "strict": {"warmup_sec": 0.50, "clip_negative": True, "hard_max_ns": None, "robust_z_max": 7.0}  # MAD‑based robust Z
 }
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -69,7 +77,7 @@ def _row_to_dict(row) -> dict:
           "approved","approved_by","approved_at","png_b64")
     return dict(zip(keys,row))
 
-# ─── CSV ingestion (unchanged) ───────────────────────────────────────────────
+# ─── CSV ingestion (unchanged except docstring) ──────────────────────────────
 def _ingest_new_files() -> None:
     with sqlite3.connect(DB_PATH) as c:
         known = {r[0] for r in c.execute("SELECT id FROM runs")}
@@ -104,6 +112,7 @@ async def auto_ingest(request: Request, call_next):
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 def _per_second_quantiles(df) -> Tuple[List[str], List[float], List[float], List[float]]:
+    df = df.copy()
     df["sec"] = (df["ingress"] // 1_000_000_000)
     grouped   = df.groupby("sec")["latency_ns"]
     p50 = grouped.quantile(0.50); p95 = grouped.quantile(0.95); p99 = grouped.quantile(0.99)
@@ -141,7 +150,7 @@ def _summary_stats(lat: pd.Series) -> Dict[str, float]:
     stdev = float(statistics.pstdev(lat))
     denom = madn if madn > 0 else 1.0
     robust_z = ((lat - median).abs() / denom)
-    outlier_rate = float((robust_z > 3.5).mean())
+    outlier_rate = float((robust_z > 3.5).mean()) if madn > 0 else 0.0
     return {
         "p50": float(q.loc[0.5]),
         "p95": float(q.loc[0.95]),
@@ -156,6 +165,49 @@ def _summary_stats(lat: pd.Series) -> Dict[str, float]:
         "count": int(lat.size),
         "outlier_rate": outlier_rate,
     }
+
+def _apply_filters(df: pd.DataFrame, mode: str) -> Tuple[pd.DataFrame, Dict[str, object]]:
+    """Apply server-side filtering for decision metrics/CDF."""
+    cfg = FILTER_CONFIG.get(mode, FILTER_CONFIG[FILTER_DEFAULT])
+    lat = pd.to_numeric(df["latency_ns"], errors="coerce")
+    msk = pd.Series(True, index=df.index)
+
+    if cfg.get("clip_negative", False):
+        msk &= (lat >= 0)
+
+    warm = float(cfg.get("warmup_sec", 0.0) or 0.0)
+    if warm > 0.0 and not df.empty:
+        t0 = int(df["ingress"].min())
+        cutoff = t0 + int(warm * 1_000_000_000)
+        msk &= (df["ingress"] >= cutoff)
+
+    hard_max = cfg.get("hard_max_ns")
+    if hard_max:
+        msk &= (lat <= int(hard_max))
+
+    df_f = df[msk]
+    rz_max = cfg.get("robust_z_max")
+    rz_used = None
+    if rz_max and not df_f.empty:
+        med = df_f["latency_ns"].median()
+        mad = (df_f["latency_ns"] - med).abs().median()
+        madn = 1.4826 * mad if mad > 0 else 0.0
+        if madn > 0:
+            rz = (df_f["latency_ns"] - med).abs() / madn
+            df_f = df_f[rz <= float(rz_max)]
+            rz_used = float(rz_max)
+
+    info = {
+        "mode": mode,
+        "warmup_sec": warm,
+        "clip_negative": bool(cfg.get("clip_negative", False)),
+        "hard_max_ns": int(hard_max) if hard_max else None,
+        "robust_z_max": rz_used,
+        "n_raw": int(df.shape[0]),
+        "n_used": int(df_f.shape[0]),
+        "dropped": int(df.shape[0] - df_f.shape[0]),
+    }
+    return df_f, info
 
 def _find_default_baseline_id(current_id: str) -> Optional[str]:
     with sqlite3.connect(DB_PATH) as c:
@@ -207,13 +259,13 @@ def latest_redirect():
     return RedirectResponse(f"/runs/{row[0]}", status_code=303)
 
 @app.get("/runs/{run_id}", response_class=HTMLResponse)
-def show_run(request: Request, run_id:str):
+def show_run(request: Request, run_id:str, filter: str = FILTER_DEFAULT):
     with sqlite3.connect(DB_PATH) as c:
         row=c.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
     if not row: raise HTTPException(404)
     d=_row_to_dict(row)
 
-    # Load CSV
+    # Load CSV (raw)
     csv_path=CSV_DIR/d["filename"]
     if not csv_path.exists(): raise HTTPException(500,"CSV missing")
     df=pd.read_csv(csv_path, skipinitialspace=True,
@@ -221,20 +273,27 @@ def show_run(request: Request, run_id:str):
         dtype={"ingress":"int64","latency_ns":"int64"}, engine="python").sort_values("ingress")
     df["ingress_dt"]=pd.to_datetime(df["ingress"], unit="ns", utc=True)
 
-    # Raw plot data (current only)
+    # Apply filter policy for metrics/CDF
+    df_f, filt_info = _apply_filters(df, filter)
+
+    # Raw plot data (current only — unfiltered)
     x_json=json.dumps(df["ingress_dt"].dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ").tolist())
     y_json=json.dumps(df["latency_ns"].tolist())
 
-    # Per-second quantiles (current only)
-    sec_iso,p50s,p95s,p99s=_per_second_quantiles(df)
+    # Per-second quantiles (filtered for stability)
+    sec_iso,p50s,p95s,p99s=_per_second_quantiles(df_f)
 
-    # Rollups for current run
-    stats = _summary_stats(df["latency_ns"])
+    # Rollups for current run (filtered)
+    stats = _summary_stats(df_f["latency_ns"])
 
-    # CDF (no extra deps)
+    # CDF (filtered)
     points = 300
-    ps = [(i+1)/(points+1) for i in range(points)]
-    qs = df["latency_ns"].quantile(ps).astype(float).tolist()
+    lat_f = pd.to_numeric(df_f["latency_ns"], errors="coerce").dropna()
+    if lat_f.empty:
+        ps, qs = [], []
+    else:
+        ps = [(i+1)/(points+1) for i in range(points)]
+        qs = lat_f.quantile(ps).astype(float).tolist()
 
     # Baseline options & auto-select
     baseline_default = _find_default_baseline_id(run_id) or ""
@@ -252,7 +311,8 @@ def show_run(request: Request, run_id:str):
          "stats_json": json.dumps(stats),
          "cdf_p_json": json.dumps(ps),
          "cdf_q_json": json.dumps(qs),
-         "rules_json": json.dumps(INTERPRETATION_RULES)})
+         "rules_json": json.dumps(INTERPRETATION_RULES),
+         "filter_info_json": json.dumps(filt_info)})
 
 @app.post("/runs/{run_id}/approve")
 def approve(run_id:str, user:str=Form("anon")):
@@ -287,25 +347,56 @@ def view_logs(lines:int=1000):
 
 # ─── Lightweight JSON for overlays/compare ───────────────────────────────────
 @app.get("/runs/{run_id}/cdf_json")
-def cdf_json(run_id:str, points:int=300):
+def cdf_json(run_id:str, points:int=300, filter: str = FILTER_DEFAULT):
     points = max(50, min(int(points), 2000))
     meta = _load_run_meta(run_id)
     df   = _load_run_df_by_meta(meta)
-    lat  = pd.to_numeric(df["latency_ns"], errors="coerce").dropna()
+    df_f, _info = _apply_filters(df, filter)
+    lat  = pd.to_numeric(df_f["latency_ns"], errors="coerce").dropna()
     if lat.empty:
-        return {"run_id":run_id,"p":[],"q_ns":[]}
+        return {"run_id":run_id,"p":[],"q_ns":[],"filter":filter}
     ps   = [(i+1)/(points+1) for i in range(points)]
     qs   = lat.quantile(ps).astype(float).tolist()
-    return {"run_id":run_id,"p":ps,"q_ns":qs}
+    return {"run_id":run_id,"p":ps,"q_ns":qs,"filter":filter}
+
+def _exceedance_significance(cur_lat: pd.Series, base: Dict[str,float]) -> Dict[str, Dict[str, float]]:
+    """For each quantile q in {0.5,0.95,0.99,0.999}, compute fraction of current samples
+       exceeding the baseline threshold, and a binomial z-score vs expected (1-q)."""
+    res = {}
+    if cur_lat is None or cur_lat.size == 0:
+        for k in ("p50","p95","p99","p999"):
+            res[k] = {"threshold_ns": float('nan'), "above_frac": float('nan'),
+                      "expected_above": float('nan'), "z": None, "n": 0}
+        return res
+    mapping = {"p50":0.5,"p95":0.95,"p99":0.99,"p999":0.999}
+    lat = pd.to_numeric(cur_lat, errors="coerce").dropna()
+    n = int(lat.size)
+    for k,q in mapping.items():
+        thr = float(base.get(k, float('nan')))
+        if pd.isna(thr) or n == 0:
+            res[k] = {"threshold_ns": float('nan'), "above_frac": float('nan'),
+                      "expected_above": float('nan'), "z": None, "n": n}
+            continue
+        above = float((lat > thr).mean()) if n>0 else float('nan')
+        p0 = 1.0 - q  # expected above fraction under no change
+        se = (p0*(1.0-p0)/n)**0.5 if n>0 else float('nan')
+        z  = ((above - p0)/se) if (se and se>0) else None
+        res[k] = {"threshold_ns": thr, "above_frac": above,
+                  "expected_above": p0, "z": z, "n": n}
+    return res
 
 @app.get("/runs/{run_id}/compare")
-def compare_runs(run_id:str, baseline_id:str):
+def compare_runs(run_id:str, baseline_id:str, filter: str = FILTER_DEFAULT):
     base_meta = _load_run_meta(baseline_id)
     cur_meta  = _load_run_meta(run_id)
     base_df   = _load_run_df_by_meta(base_meta)
     cur_df    = _load_run_df_by_meta(cur_meta)
-    base = _summary_stats(base_df["latency_ns"])
-    cur  = _summary_stats(cur_df["latency_ns"])
+
+    base_df_f, base_info = _apply_filters(base_df, filter)
+    cur_df_f,  cur_info  = _apply_filters(cur_df,  filter)
+
+    base = _summary_stats(base_df_f["latency_ns"])
+    cur  = _summary_stats(cur_df_f["latency_ns"])
 
     def diff(a:float,b:float):
         if b == 0:
@@ -314,14 +405,27 @@ def compare_runs(run_id:str, baseline_id:str):
 
     metrics = ["p50","p95","p99","p999","stdev","madn","iqr","mean","outlier_rate","count"]
     delta = {m: diff(cur.get(m,0.0), base.get(m,0.0)) for m in metrics}
-    return {"run_id":run_id, "baseline_id":baseline_id,
-            "current":cur, "baseline":base, "delta":delta}
+
+    significance = _exceedance_significance(cur_df_f["latency_ns"], base)
+
+    return {
+        "run_id":run_id, "baseline_id":baseline_id,
+        "filter": filter,
+        "current":cur, "baseline":base, "delta":delta,
+        "significance": significance,
+        "counts": {"current_used": int(cur_info["n_used"]), "baseline_used": int(base_info["n_used"])}
+    }
+
+
+
+
 
 
 
 
 
 base.html
+
 
 
 <!DOCTYPE html>
@@ -347,31 +451,6 @@ base.html
     .content-wrap { padding: 1.25rem 0 2rem; }
   </style>
   <script>
-    // Theme handling (light/dark) with localStorage, and notify pages to restyle charts
-    (function(){
-      const KEY = 'lp-theme';
-      const html = document.documentElement;
-      function apply(theme){
-        const t = theme === 'dark' ? 'dark' : 'light';
-        html.setAttribute('data-bs-theme', t);
-        localStorage.setItem(KEY, t);
-        document.dispatchEvent(new CustomEvent('theme-changed', {detail:{theme:t}}));
-      }
-      function init(){
-        const saved = localStorage.getItem(KEY);
-        if (saved) apply(saved);
-        else {
-          // Prefer system
-          const prefersDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
-          apply(prefersDark ? 'dark' : 'light');
-        }
-        const btn = document.getElementById('themeToggle');
-        if (btn) btn.addEventListener('click', ()=> {
-          apply(html.getAttribute('data-bs-theme') === 'dark' ? 'light' : 'dark');
-        });
-      }
-      document.addEventListener('DOMContentLoaded', init);
-    })();
     // Enable tooltips site-wide
     document.addEventListener('DOMContentLoaded', ()=> {
       [...document.querySelectorAll('[data-bs-toggle="tooltip"]')]
@@ -393,9 +472,6 @@ base.html
           <li class="nav-item"><a class="nav-link" href="/runs/latest">Latest</a></li>
           <li class="nav-item"><a class="nav-link" href="/logs">Logs</a></li>
         </ul>
-        <div class="d-flex align-items-center gap-2">
-          <button id="themeToggle" class="btn btn-outline-secondary btn-sm" type="button" title="Toggle theme" data-bs-toggle="tooltip">🌙/☀️</button>
-        </div>
       </div>
     </div>
   </nav>
@@ -409,7 +485,12 @@ base.html
 
 
 
+
+
+
+
 list.html
+
 
 {% extends 'base.html' %}{% block title %}Latency Benchmarks{% endblock %}
 {% block content %}
@@ -468,8 +549,8 @@ list.html
 {% endblock %}
 
 
-
 detail.html
+
 
 {% extends 'base.html' %}{% block title %}Run {{ id }}{% endblock %}
 {% block content %}
@@ -479,10 +560,10 @@ detail.html
   .pill .value { font-weight:600; }
   .metric-row { display:flex; flex-wrap:wrap; gap:.5rem .75rem; }
 
-  .delta-chip { padding:.25rem .5rem; border-radius:.5rem; font-weight:600; display:inline-flex; gap:.35rem; align-items:center; }
-  .delta-up   { color:#842029; background:#f8d7da; }   /* regression */
-  .delta-down { color:#0f5132; background:#d1e7dd; }   /* improvement */
-  .delta-watch { color:#664d03; background:#fff3cd; }  /* watch */
+  .delta-chip { padding:.25rem .5rem; border-radius:.5rem; font-weight:600; display:inline-flex; gap:.35rem; align-items:center; border:1px solid var(--bs-border-color); }
+  .delta-up      { color:#7f1d1d; background:#fde2e2; }   /* regression */
+  .delta-down    { color:#0f5132; background:#d1e7dd; }   /* improvement */
+  .delta-watch   { color:#664d03; background:#fff3cd; }   /* watch */
   .delta-unknown { color:var(--bs-secondary-color); background:var(--bs-tertiary-bg); }
 
   .card-clean { border:1px solid var(--bs-border-color); border-radius:.5rem; }
@@ -516,24 +597,34 @@ detail.html
     </div>
   </div>
 
-  <!-- Baseline selector -->
-  <div>
-    <label class="form-label mb-1">Baseline</label>
-    <select id="baselineSelect" class="form-select form-select-sm" style="min-width: 300px;">
-      <option value="" {% if not baseline_default %}selected{% endif %}>— none —</option>
-      {% for r in baseline_runs %}
-        <option value="{{ r.id }}" {% if baseline_default and r.id == baseline_default %}selected{% endif %}>
-          {{ r.id }} · {{ r.created_at[:19] }} UTC{% if r.approved %} ✓{% endif %}
-        </option>
-      {% endfor %}
-    </select>
-    <div class="form-text">Used for CDF overlay and deltas.</div>
+  <!-- Baseline + Filter selectors -->
+  <div class="d-flex flex-column gap-2 align-items-stretch">
+    <div>
+      <label class="form-label mb-1">Baseline</label>
+      <select id="baselineSelect" class="form-select form-select-sm" style="min-width: 300px;">
+        <option value="" {% if not baseline_default %}selected{% endif %}>— none —</option>
+        {% for r in baseline_runs %}
+          <option value="{{ r.id }}" {% if baseline_default and r.id == baseline_default %}selected{% endif %}>
+            {{ r.id }} · {{ r.created_at[:19] }} UTC{% if r.approved %} ✓{% endif %}
+          </option>
+        {% endfor %}
+      </select>
+      <div class="form-text">Used for CDF overlay and deltas.</div>
+    </div>
+    <div>
+      {% set fi = filter_info_json|safe %}
+      <label class="form-label mb-1">Filter</label>
+      <select id="filterSelect" class="form-select form-select-sm" style="min-width: 300px;">
+        {% set fmode = (filter_info_json|safe) %}
+      </select>
+      <div class="form-text" id="filterHelp"></div>
+    </div>
   </div>
 </div>
 
 <!-- Compact, labeled delta summary -->
 <div id="delta-summary" class="row g-2 mb-3" style="display:none;">
-  <div class="col-12 col-md-auto"><span class="text-muted">Δ vs baseline:</span></div>
+  <div class="col-12 col-md-auto"><span class="text-muted">Δ vs baseline (advisory):</span></div>
   <div class="col-auto"><span class="delta-chip" id="d-p50">Δ P50</span></div>
   <div class="col-auto"><span class="delta-chip" id="d-p95">Δ P95</span></div>
   <div class="col-auto"><span class="delta-chip" id="d-p99">Δ P99</span></div>
@@ -557,14 +648,17 @@ detail.html
 <div class="tab-content">
   <div class="tab-pane fade show active" id="pane-cdf" role="tabpanel" aria-labelledby="tab-cdf">
     <div id="cdfplot" style="height:380px;"></div>
-    <div class="form-check mt-2">
-      <input class="form-check-input" type="checkbox" id="toggleBaselineCDF" checked>
-      <label class="form-check-label" for="toggleBaselineCDF">Overlay baseline on CDF</label>
+    <div class="d-flex align-items-center gap-3 mt-2">
+      <div class="form-check">
+        <input class="form-check-input" type="checkbox" id="toggleBaselineCDF" checked>
+        <label class="form-check-label" for="toggleBaselineCDF">Overlay baseline on CDF</label>
+      </div>
+      <div class="small text-muted" id="cdfNote"></div>
     </div>
   </div>
   <div class="tab-pane fade" id="pane-quant" role="tabpanel" aria-labelledby="tab-quant">
     <div id="quantplot" style="height:360px;"></div>
-    <div class="form-text">Current run only — use CDF for baseline comparison.</div>
+    <div class="form-text">Quantiles computed on the <b>filtered</b> series for stability (raw available below).</div>
   </div>
   <div class="tab-pane fade" id="pane-raw" role="tabpanel" aria-labelledby="tab-raw">
     <div id="rawplot" style="height:360px;"></div>
@@ -572,18 +666,18 @@ detail.html
   </div>
 </div>
 
-<!-- Stability & tail indicators (plain-English) -->
+<!-- Stability & tail indicators (HFT aware) -->
 <div class="card card-clean mt-4">
   <div class="card-header"><strong>Stability & tail indicators</strong></div>
   <div class="card-body">
     <div class="row row-cols-2 row-cols-md-3 row-cols-lg-4 g-3" id="current-stats"></div>
     <details class="mt-2">
-      <summary class="small text-muted">How to read these</summary>
+      <summary class="small text-muted">How to read these (HFT context)</summary>
       <ul class="small mb-0">
-        <li><b>Ultra tail (P99.9)</b>: extreme latency; improvements here protect worst‑case behaviour.</li>
-        <li><b>Jitter (robust)</b>: variability insensitive to outliers (MAD-based). Lower = steadier.</li>
-        <li><b>Spread (IQR)</b>: middle 50% band width. Lower = tighter bulk.</li>
-        <li><b>Outliers (%)</b>: share of samples flagged by a robust rule; lower is better.</li>
+        <li><b>Ultra tail (P99.9)</b>: worst‑case tick‑to‑trade. Guardrail for exchange microbursts & lock‑contention spikes.</li>
+        <li><b>Jitter (robust)</b>: MAD‑based variability; tracks micro‑burst response more reliably than σ.</li>
+        <li><b>Spread (IQR)</b>: middle 50% width. Tighter bulk reduces queueing & scheduling risk.</li>
+        <li><b>Outliers (%)</b>: robust outlier share (3.5×MAD rule). A rising rate often signals GC pauses, kernel hiccups, or NIC queue issues.</li>
       </ul>
     </details>
   </div>
@@ -591,25 +685,26 @@ detail.html
 
 <!-- Interpretation guide -->
 <div class="card card-clean mt-4">
-  <div class="card-header"><strong>Interpretation guide (default thresholds)</strong></div>
+  <div class="card-header"><strong>Interpretation guide (HFT defaults; advisory only)</strong></div>
   <div class="card-body">
     <div class="row row-cols-1 row-cols-lg-2 g-3">
       <div>
         <table class="table table-sm">
           <thead class="table-light">
-            <tr><th>Metric</th><th>Warn if</th><th>Fail if</th></tr>
+            <tr><th>Metric</th><th>Warn if</th><th>Escalate if</th></tr>
           </thead>
           <tbody id="guide-table"></tbody>
         </table>
       </div>
       <div class="small text-muted">
-        <p class="mb-2">Use the CDF overlay to verify distribution shifts. Tail metrics (P99/P99.9) matter more than P50 in production risk.</p>
-        <ul class="mb-0">
-          <li><b>P50</b>: UX/snappiness. OK to trade small regressions for big tail wins.</li>
-          <li><b>P95/P99</b>: latency under load. Keep regressions here limited.</li>
-          <li><b>P99.9</b>: worst‑case protection. Prioritize improvements here.</li>
-          <li><b>Outliers</b>: noisy tails; rising rate signals instability or intermittent issues.</li>
+        <p class="mb-2"><b>No auto‑reject.</b> Thresholds gate alerts; approval stays human‑in‑the‑loop.</p>
+        <ul class="mb-2">
+          <li><b>P50</b>: trader feel/snappiness; trade small P50 increases for large tail wins.</li>
+          <li><b>P95/P99</b>: sustained burst handling; keep regressions limited unless P99.9 improves meaningfully.</li>
+          <li><b>P99.9</b>: misses & protection under exchange microstructure stress; prioritize improvements here.</li>
+          <li><b>Outliers</b>: if steady‑state outlier share rises, dig into allocator pressure, IRQ affinity, queue depths.</li>
         </ul>
+        <p class="mb-0">Chips consider three things: <i>relative delta</i>, <i>absolute delta</i> (ns/pp), and a <i>persistence test</i> (exceedance z‑score vs. baseline).</p>
       </div>
     </div>
   </div>
@@ -633,11 +728,19 @@ detail.html
 {% endif %}
 
 <script>
-  // ---------- Utils
+  // ---------- Constants & config
   const RULES = {{ rules_json|safe }};
-  const fmtInt = (v)=> (v===null||v===undefined) ? '–' : Math.round(v).toLocaleString('en');
-  const fmtNs  = (v)=> (v===null||v===undefined) ? '–' : Math.round(v).toLocaleString('en') + ' ns';
-  const fmtPct = (v)=> (v===null||v===undefined) ? '–' : v.toFixed(2) + ' %';
+  const FILTER_INFO = {{ filter_info_json|safe }};
+  const FILTER_MODE_DEFAULT = FILTER_INFO.mode || 'light';
+  const FILTER_DESCR = {
+    "none": "No filtering (decision metrics = raw). Use when every ns matters and your feed is very stable.",
+    "light": "Drop negative latencies, ignore first 300 ms warmup. Good default to avoid start‑up artefacts.",
+    "strict": "Light + robust outlier removal (MAD Z > 7) and longer warmup. Use to sanity‑check noisy rigs."
+  };
+
+  const fmtInt = (v)=> (v===null||v===undefined || isNaN(v)) ? '–' : Math.round(v).toLocaleString('en');
+  const fmtNs  = (v)=> (v===null||v===undefined || isNaN(v)) ? '–' : Math.round(v).toLocaleString('en') + ' ns';
+  const fmtPct = (v)=> (v===null||v===undefined || isNaN(v)) ? '–' : v.toFixed(2) + ' %';
 
   function makeLayout(title, xTitle, yTitle){
     const cs = getComputedStyle(document.body);
@@ -662,14 +765,33 @@ detail.html
     };
   }
 
-  // ---------- Current-run indicators (plain names)
+  // ---------- Filter UI
+  (function initFilterUI(){
+    const sel = document.getElementById('filterSelect');
+    ['none','light','strict'].forEach(m=>{
+      const opt = document.createElement('option');
+      opt.value = m; opt.textContent = m;
+      if (m === FILTER_MODE_DEFAULT) opt.selected = true;
+      sel.appendChild(opt);
+    });
+    const help = document.getElementById('filterHelp');
+    help.innerHTML = `Using <b>${FILTER_MODE_DEFAULT}</b> filter · ${FILTER_DESCR[FILTER_MODE_DEFAULT]}<br><span class="small">n=${FILTER_INFO.n_used.toLocaleString()} (dropped ${FILTER_INFO.dropped.toLocaleString()} of ${FILTER_INFO.n_raw.toLocaleString()})</span>`;
+    sel.addEventListener('change', ()=>{
+      const m = sel.value;
+      const url = new URL(window.location.href);
+      url.searchParams.set('filter', m);
+      window.location.replace(url.toString());
+    });
+  })();
+
+  // ---------- Current-run indicators (plain names, filtered)
   (function renderCurrentStats(){
     const s = {{ stats_json|safe }};
     const items = [
-      {k:'p999',lbl:'Ultra tail (P99.9)',fmt:fmtNs, tip:'Extreme latency (99.9th)'},
+      {k:'p999',lbl:'Ultra tail (P99.9)',fmt:fmtNs, tip:'Worst‑case tick‑to‑trade'},
       {k:'madn',lbl:'Jitter (robust)',  fmt:fmtNs, tip:'MAD-based variability'},
       {k:'iqr', lbl:'Spread (IQR)',     fmt:fmtNs, tip:'Middle 50% width'},
-      {k:'outlier_rate',lbl:'Outliers (%)',fmt:(v)=>fmtPct(v*100), tip:'Robust outlier share'},
+      {k:'outlier_rate',lbl:'Outliers (%)',fmt:(v)=>fmtPct((v||0)*100), tip:'Robust outlier share'},
       {k:'mean',lbl:'Mean',fmt:fmtNs, tip:'Arithmetic mean'},
       {k:'stdev',lbl:'σ',fmt:fmtNs, tip:'Population standard deviation'},
       {k:'min',lbl:'Min',fmt:fmtNs, tip:'Minimum latency'},
@@ -702,13 +824,17 @@ detail.html
       const r = RULES[k];
       const warn = r.unit==='pp' ? `${r.warn} pp` : `${r.warn}%`;
       const fail = r.unit==='pp' ? `${r.fail} pp` : `${r.fail}%`;
+      const minAbs = (k==='outlier_rate')
+        ? ((r.min_pp!=null)? ` &nbsp;· min ${r.min_pp} pp` : '')
+        : ((r.min_abs_ns!=null)? ` &nbsp;· min ${r.min_abs_ns} ns` : '');
+      const z = (r.z_warn && r.z_fail) ? ` &nbsp;· z≥${r.z_warn} / z≥${r.z_fail}` : '';
       const tr = document.createElement('tr');
-      tr.innerHTML = `<td>${label}</td><td>+${warn}</td><td>+${fail}</td>`;
+      tr.innerHTML = `<td>${label}</td><td>+${warn}${minAbs}${z}</td><td>+${fail}${minAbs}${z}</td>`;
       tbody.appendChild(tr);
     });
   })();
 
-  // ---------- CDF (current + optional baseline overlay)
+  // ---------- CDF (current + optional baseline overlay), filtered
   const CURRENT_CDF = { p: {{ cdf_p_json|safe }}, q_ns: {{ cdf_q_json|safe }}, run_id: "{{ id }}" };
   let baselineCDF = null;
 
@@ -724,16 +850,10 @@ detail.html
         name: `${baselineCDF.run_id} (baseline)`, mode:'lines', line:{dash:'dot'}
       });
     }
-    Plotly.react('cdfplot', data, makeLayoutXY('Latency distribution (CDF)','Latency (ns)','Cumulative (%)'));
+    Plotly.react('cdfplot', data, makeLayoutXY('Latency distribution (CDF, filtered)','Latency (ns)','Cumulative (%)'));
+    const note = document.getElementById('cdfNote');
+    note.textContent = `Filter=${FILTER_MODE_DEFAULT}. Baseline overlay uses the same filter.`;
   }
-
-  document.getElementById('toggleBaselineCDF').addEventListener('change', renderCDF);
-  document.addEventListener('theme-changed', ()=> {
-    // update plot font colors on theme switch
-    Plotly.relayout('cdfplot', makeLayoutXY('Latency distribution (CDF)','Latency (ns)','Cumulative (%)'));
-    if (quantReady) Plotly.relayout('quantplot', makeLayout('Per-second quantiles (current)','Time (1-s buckets)','Latency (ns)'));
-    if (rawReady)   Plotly.relayout('rawplot', makeLayout('Latency per message (current)','Ingress time','Latency (ns)'));
-  });
 
   // ---------- Quantiles & Raw (render on first tab show for sizing)
   let quantReady=false, rawReady=false;
@@ -744,51 +864,78 @@ detail.html
         {x:{{ sec_json|safe }}, y:{{ p50_json|safe }}, name:'P50', mode:'lines'},
         {x:{{ sec_json|safe }}, y:{{ p95_json|safe }}, name:'P95', mode:'lines'},
         {x:{{ sec_json|safe }}, y:{{ p99_json|safe }}, name:'P99', mode:'lines'}
-      ], makeLayout('Per-second quantiles (current)','Time (1-s buckets)','Latency (ns)'));
+      ], makeLayout('Per-second quantiles (filtered)','Time (1-s buckets)','Latency (ns)'));
       quantReady=true;
     }
     if (id === '#pane-raw' && !rawReady){
       Plotly.newPlot('rawplot', [{x:{{ x_json|safe }}, y:{{ y_json|safe }}, mode:'lines', line:{width:1}}],
-        makeLayout('Latency per message (current)','Ingress time','Latency (ns)'));
+        makeLayout('Latency per message (raw)','Ingress time','Latency (ns)'));
       rawReady=true;
     }
   });
 
-  // ---------- Baseline selection: overlay CDF + labeled delta chips
+  // ---------- Baseline selection + deltas (with significance gating)
   function chip(el, text, cls){ el.textContent = text; el.className = `delta-chip ${cls}`; }
 
-  function severityFor(metricKey, delta){
-    const r = RULES[metricKey]; if (!r) return {level:'unknown', value:null};
-    if (metricKey === 'outlier_rate'){
-      // use absolute delta in percentage points
-      const val = Math.abs((delta && delta.abs!=null) ? delta.abs*100 : NaN);
-      if (isNaN(val)) return {level:'unknown', value:null};
-      if (val >= r.fail) return {level:'fail', value:val};
-      if (val >= r.warn) return {level:'watch', value:val};
-      return {level:'ok', value:val};
-    } else {
-      const val = Math.abs((delta && delta.pct!=null) ? delta.pct : NaN);
-      if (isNaN(val)) return {level:'unknown', value:null};
-      if (val >= r.fail) return {level:'fail', value:val};
-      if (val >= r.warn) return {level:'watch', value:val};
-      return {level:'ok', value:val};
+  function severityFor(metricKey, delta, sig){
+    const r = RULES[metricKey] || {};
+    if (!delta) return {level:'unknown', reason:'no-delta'};
+
+    // Absolute floors (ns / pp)
+    let absOK = true;
+    if (metricKey === 'outlier_rate' && r.min_pp!=null){
+      const delta_pp = Math.abs((delta.abs||0)*100);
+      absOK = delta_pp >= r.min_pp;
+    } else if (r.min_abs_ns!=null){
+      absOK = Math.abs(delta.abs||0) >= r.min_abs_ns;
     }
+
+    // Percent thresholds
+    const pctAbs = Math.abs(delta.pct==null ? 0 : delta.pct);
+    const pctOKWarn = pctAbs >= (r.warn||Infinity);
+    const pctOKFail = pctAbs >= (r.fail||Infinity);
+
+    // Significance gate via exceedance test (for p50/p95/p99/p999)
+    let z = null, zOKWarn = true, zOKFail = false;
+    if (sig && typeof sig.z === 'number'){
+      z = Math.abs(sig.z);
+      if (r.z_warn!=null)  zOKWarn = z >= r.z_warn;
+      if (r.z_fail!=null)  zOKFail = z >= r.z_fail;
+    }
+
+    // Combine: need (abs floor) AND (pct warn/fail) AND (z gate if available)
+    const passWarn = absOK && (pctOKWarn) && zOKWarn;
+    const passFail = absOK && (pctOKFail) && (zOKFail || zOKWarn); // accept strong pct even if z just >= warn
+
+    if (passFail) return {level:'fail', z, pctAbs};
+    if (passWarn) return {level:'watch', z, pctAbs};
+    return {level:'ok', z, pctAbs};
   }
 
-  function paintDelta(elId, metricKey, delta, unitLabel){
+  function paintDelta(elId, metricKey, delta, sig){
     const el = document.getElementById(elId);
     if (!delta){ chip(el, `${RULES[metricKey].label}: n/a`, 'delta-unknown'); return; }
     const lowerIsBetter = new Set(['p50','p95','p99','p999','outlier_rate']);
-    const regression = lowerIsBetter.has(metricKey) ? (delta.abs>0) : (delta.abs<0);
-    // Build text: Δ X: +123 ns (+4.2%) [OK/Watch/Fail]
+
+    // Human-readable delta parts
     const pctText = (delta.pct==null || isNaN(delta.pct)) ? '' : ` (${delta.pct.toFixed(2)}%)`;
-    const absVal = metricKey==='outlier_rate' ? (delta.abs*100).toFixed(2) + ' pp' : Math.round(delta.abs) + ' ns';
-    const sev = severityFor(metricKey, delta);
-    // Improvements are always OK
-    const level = regression ? sev.level : 'ok';
+    const absVal = metricKey==='outlier_rate' ? (delta.abs*100).toFixed(2) + ' pp'
+                                              : Math.round(delta.abs) + ' ns';
+
+    // Direction
+    const isRegression = lowerIsBetter.has(metricKey) ? (delta.abs>0) : (delta.abs<0);
+
+    // Severity with gates
+    const sev = severityFor(metricKey, delta, sig);
     const clsMap = {ok:'delta-down', watch:'delta-watch', fail:'delta-up', unknown:'delta-unknown'};
-    const statusLabel = {ok:'OK', watch:'WATCH', fail:'FAIL', unknown:'N/A'}[level];
-    chip(el, `Δ ${RULES[metricKey].label}: ${absVal}${pctText} • ${statusLabel}`, clsMap[level]);
+    // Improvements are always OK (green)
+    const finalLevel = isRegression ? sev.level : 'ok';
+    const statusLabel = {ok:'OK', watch:'WATCH', fail:'REGRESSION', unknown:'N/A'}[finalLevel];
+
+    // Optional: z-score annotation
+    const zTxt = (sig && typeof sig.z === 'number') ? ` • z=${Math.abs(sig.z).toFixed(2)}` : '';
+
+    chip(el, `Δ ${RULES[metricKey].label}: ${absVal}${pctText} • ${statusLabel}${zTxt}`, clsMap[finalLevel]);
   }
 
   async function updateComparison(baselineId){
@@ -797,28 +944,32 @@ detail.html
       baselineCDF = null; renderCDF(); summary.style.display='none';
       return;
     }
-    baselineCDF = await (await fetch(`/runs/${baselineId}/cdf_json?points=300`)).json();
+    baselineCDF = await (await fetch(`/runs/${baselineId}/cdf_json?points=300&filter=${FILTER_MODE_DEFAULT}`)).json();
     renderCDF();
 
-    const cmp = await (await fetch(`/runs/{{ id }}/compare?baseline_id=${baselineId}`)).json();
+    const cmp = await (await fetch(`/runs/{{ id }}/compare?baseline_id=${baselineId}&filter=${FILTER_MODE_DEFAULT}`)).json();
     summary.style.display='flex';
 
-    paintDelta('d-p50',  'p50',  cmp.delta.p50,  'ns');
-    paintDelta('d-p95',  'p95',  cmp.delta.p95,  'ns');
-    paintDelta('d-p99',  'p99',  cmp.delta.p99,  'ns');
-    paintDelta('d-p999', 'p999', cmp.delta.p999, 'ns');
-    paintDelta('d-or',   'outlier_rate', cmp.delta.outlier_rate, '%');
+    // Paint deltas with significance
+    paintDelta('d-p50',  'p50',  cmp.delta.p50,  cmp.significance.p50);
+    paintDelta('d-p95',  'p95',  cmp.delta.p95,  cmp.significance.p95);
+    paintDelta('d-p99',  'p99',  cmp.delta.p99,  cmp.significance.p99);
+    paintDelta('d-p999', 'p999', cmp.delta.p999, cmp.significance.p999);
+    paintDelta('d-or',   'outlier_rate', cmp.delta.outlier_rate, null);
   }
 
-  const sel = document.getElementById('baselineSelect');
-  sel.addEventListener('change', (e)=> updateComparison(e.target.value));
+  const selBaseline = document.getElementById('baselineSelect');
+  selBaseline.addEventListener('change', (e)=> updateComparison(e.target.value));
 
-  // Auto-load default baseline if present
-  {% if baseline_default %}
-    updateComparison("{{ baseline_default }}");
-  {% else %}
+  // Initial render
+  (async function init(){
+    // Render initial CDF (current only)
     renderCDF();
-  {% endif %}
+    // Load default baseline if present
+    {% if baseline_default %}
+      await updateComparison("{{ baseline_default }}");
+    {% endif %}
+  })();
 </script>
 {% endblock %}
 
