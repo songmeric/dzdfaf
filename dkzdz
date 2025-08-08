@@ -1,425 +1,3 @@
-#!/usr/bin/env python3
-"""
-latency-portal  ◆  nano-latency visualiser
-
-Updates in this revision:
-- Light mode only (UI unchanged here; dark removed in templates earlier)
-- Interpretation uses academic framing + significance
-- Only 'warn' thresholds (no red / escalate); approval stays manual
-- Optional filtering (none/light/strict) remains for stability
-- Exceedance test vs baseline (binomial z) still provided to client
-"""
-
-import base64, io, json, logging, pathlib, sqlite3, statistics, datetime as dt
-from typing import List, Tuple, Optional, Dict
-import pandas as pd
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-from fastapi import FastAPI, Request, HTTPException, Form
-from fastapi.responses import HTMLResponse, RedirectResponse, PlainTextResponse
-from fastapi.templating import Jinja2Templates
-
-CSV_DIR = pathlib.Path("/apps/sp_hfts/latency_csv"); CSV_DIR.mkdir(parents=True, exist_ok=True)
-BASE_DIR = pathlib.Path(__file__).parent
-LOG_FILE = BASE_DIR / "portal.log"
-DB_PATH  = str(CSV_DIR / "runs.db")
-TPL_DIR  = BASE_DIR / "templates"
-
-logging.basicConfig(level=logging.INFO,
-                    format="%(asctime)s  %(levelname)-8s %(message)s",
-                    handlers=[logging.FileHandler(LOG_FILE, encoding="utf-8"),
-                              logging.StreamHandler()])
-log = logging.getLogger("latency-portal")
-
-app       = FastAPI(title="Latency-Portal")
-templates = Jinja2Templates(directory=str(TPL_DIR))
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Interpretation thresholds (academic/statistical stance)
-# Only 'warn' levels; no 'fail' (no red). unit: "pct" (percent change) or "pp" (percentage points).
-# Absolute floors suppress tiny absolute changes. z_warn gates warnings by persistence/significance.
-INTERPRETATION_RULES = {
-    "p50":  {"warn": 12.0, "unit": "pct", "label": "P50",   "min_abs_ns": 50,  "z_warn": 2.5},
-    "p95":  {"warn": 9.0,  "unit": "pct", "label": "P95",   "min_abs_ns": 100, "z_warn": 2.5},
-    "p99":  {"warn": 7.0,  "unit": "pct", "label": "P99",   "min_abs_ns": 120, "z_warn": 2.5},
-    "p999": {"warn": 5.0,  "unit": "pct", "label": "P99.9", "min_abs_ns": 200, "z_warn": 2.5},
-    # outlier_rate is measured as share ∈ [0,1]; deltas are judged in percentage points
-    "outlier_rate": {"warn": 0.5, "unit": "pp", "label": "Outlier rate", "min_pp": 0.1}
-}
-
-# Default filtering policy used for CDF/quantiles/summary (raw plot stays raw)
-FILTER_DEFAULT = "light"
-FILTER_CONFIG = {
-    "none":   {"warmup_sec": 0.0, "clip_negative": True, "hard_max_ns": None, "robust_z_max": None},
-    "light":  {"warmup_sec": 0.30, "clip_negative": True, "hard_max_ns": None, "robust_z_max": None},
-    "strict": {"warmup_sec": 0.50, "clip_negative": True, "hard_max_ns": None, "robust_z_max": 7.0}
-}
-# ──────────────────────────────────────────────────────────────────────────────
-
-def _init_db() -> None:
-    with sqlite3.connect(DB_PATH) as c:
-        c.execute("""CREATE TABLE IF NOT EXISTS runs(
-            id          TEXT PRIMARY KEY,
-            filename    TEXT,
-            created_at  TEXT,
-            p50         REAL, p95 REAL, p99 REAL,
-            stdev       REAL, count INTEGER,
-            approved    INTEGER DEFAULT 0,
-            approved_by TEXT, approved_at TEXT,
-            png_b64     TEXT );""")
-_init_db()
-
-def _row_to_dict(row) -> dict:
-    keys=("id","filename","created_at","p50","p95","p99","stdev","count",
-          "approved","approved_by","approved_at","png_b64")
-    return dict(zip(keys,row))
-
-# ─── CSV ingestion ───────────────────────────────────────────────────────────
-def _ingest_new_files() -> None:
-    with sqlite3.connect(DB_PATH) as c:
-        known = {r[0] for r in c.execute("SELECT id FROM runs")}
-    for csv_path in CSV_DIR.glob("*.csv"):
-        run_id = csv_path.stem
-        if run_id in known: continue
-        try:
-            df = pd.read_csv(csv_path, skipinitialspace=True,
-                    names=["entry_id","ingress","egress","latency_ns"],
-                    header=0, dtype={"ingress":"int64","latency_ns":"int64"},
-                    engine="python")
-        except Exception as exc:
-            log.error("Failed to parse %s: %s", csv_path.name, exc); continue
-        if df.empty: log.error("Empty CSV %s", csv_path.name); continue
-        df.sort_values("ingress", inplace=True)
-        lat = df["latency_ns"]
-        p50,p95,p99 = (lat.quantile(q) for q in (0.5,0.95,0.99))
-        stdev = statistics.pstdev(lat)
-        fig, ax = plt.subplots(); ax.plot(df["ingress"], lat, linewidth=0.5)
-        ax.set_xlabel("Ingress ns"); ax.set_ylabel("Latency ns"); ax.set_title(run_id)
-        buf = io.BytesIO(); fig.savefig(buf, format="png", dpi=110, bbox_inches="tight")
-        plt.close(fig); png_b64 = base64.b64encode(buf.getvalue()).decode()
-        with sqlite3.connect(DB_PATH) as c:
-            c.execute("INSERT INTO runs VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-                      (run_id, csv_path.name, dt.datetime.utcnow().isoformat(),
-                       p50,p95,p99,stdev,len(lat),0,None,None,png_b64))
-        log.info("Ingested %s", csv_path.name)
-
-@app.middleware("http")
-async def auto_ingest(request: Request, call_next):
-    _ingest_new_files(); return await call_next(request)
-
-# ─── Helpers ─────────────────────────────────────────────────────────────────
-def _per_second_quantiles(df) -> Tuple[List[str], List[float], List[float], List[float]]:
-    df = df.copy()
-    df["sec"] = (df["ingress"] // 1_000_000_000)
-    grouped   = df.groupby("sec")["latency_ns"]
-    p50 = grouped.quantile(0.50); p95 = grouped.quantile(0.95); p99 = grouped.quantile(0.99)
-    idx_iso = pd.to_datetime(p50.index.astype("int64"), unit="s", utc=True)\
-                 .strftime("%Y-%m-%dT%H:%M:%SZ").tolist()
-    return idx_iso, p50.tolist(), p95.tolist(), p99.tolist()
-
-def _load_run_meta(run_id: str) -> dict:
-    with sqlite3.connect(DB_PATH) as c:
-        row = c.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
-    if not row:
-        raise HTTPException(404, "run not found")
-    return _row_to_dict(row)
-
-def _load_run_df_by_meta(meta: dict) -> pd.DataFrame:
-    csv_path = CSV_DIR / meta["filename"]
-    if not csv_path.exists():
-        raise HTTPException(500, "CSV missing")
-    df = pd.read_csv(csv_path, skipinitialspace=True,
-        names=["entry_id","ingress","egress","latency_ns"], header=0,
-        dtype={"ingress":"int64","latency_ns":"int64"}, engine="python"
-    ).sort_values("ingress")
-    return df
-
-def _summary_stats(lat: pd.Series) -> Dict[str, float]:
-    lat = pd.to_numeric(lat, errors="coerce").dropna()
-    if lat.empty:
-        return {}
-    q = lat.quantile([0.5, 0.95, 0.99, 0.999])
-    median = float(q.loc[0.5])
-    mad = float((lat - median).abs().median())
-    madn = float(1.4826 * mad) if mad > 0 else 0.0   # robust σ
-    iqr  = float(lat.quantile(0.75) - lat.quantile(0.25))
-    mean = float(lat.mean())
-    stdev = float(statistics.pstdev(lat))
-    denom = madn if madn > 0 else 1.0
-    robust_z = ((lat - median).abs() / denom)
-    outlier_rate = float((robust_z > 3.5).mean()) if madn > 0 else 0.0
-    return {
-        "p50": float(q.loc[0.5]),
-        "p95": float(q.loc[0.95]),
-        "p99": float(q.loc[0.99]),
-        "p999": float(q.loc[0.999]),
-        "mean": mean,
-        "stdev": stdev,
-        "madn": madn,
-        "iqr": iqr,
-        "min": float(lat.min()),
-        "max": float(lat.max()),
-        "count": int(lat.size),
-        "outlier_rate": outlier_rate,
-    }
-
-def _apply_filters(df: pd.DataFrame, mode: str) -> Tuple[pd.DataFrame, Dict[str, object]]:
-    cfg = FILTER_CONFIG.get(mode, FILTER_CONFIG[FILTER_DEFAULT])
-    lat = pd.to_numeric(df["latency_ns"], errors="coerce")
-    msk = pd.Series(True, index=df.index)
-
-    if cfg.get("clip_negative", False):
-        msk &= (lat >= 0)
-
-    warm = float(cfg.get("warmup_sec", 0.0) or 0.0)
-    if warm > 0.0 and not df.empty:
-        t0 = int(df["ingress"].min())
-        cutoff = t0 + int(warm * 1_000_000_000)
-        msk &= (df["ingress"] >= cutoff)
-
-    hard_max = cfg.get("hard_max_ns")
-    if hard_max:
-        msk &= (lat <= int(hard_max))
-
-    df_f = df[msk]
-    rz_max = cfg.get("robust_z_max")
-    rz_used = None
-    if rz_max and not df_f.empty:
-        med = df_f["latency_ns"].median()
-        mad = (df_f["latency_ns"] - med).abs().median()
-        madn = 1.4826 * mad if mad > 0 else 0.0
-        if madn > 0:
-            rz = (df_f["latency_ns"] - med).abs() / madn
-            df_f = df_f[rz <= float(rz_max)]
-            rz_used = float(rz_max)
-
-    info = {
-        "mode": mode,
-        "warmup_sec": warm,
-        "clip_negative": bool(cfg.get("clip_negative", False)),
-        "hard_max_ns": int(hard_max) if hard_max else None,
-        "robust_z_max": rz_used,
-        "n_raw": int(df.shape[0]),
-        "n_used": int(df_f.shape[0]),
-        "dropped": int(df.shape[0] - df_f.shape[0]),
-    }
-    return df_f, info
-
-def _find_default_baseline_id(current_id: str) -> Optional[str]:
-    with sqlite3.connect(DB_PATH) as c:
-        row = c.execute("SELECT created_at FROM runs WHERE id=?", (current_id,)).fetchone()
-        if not row:
-            return None
-        created_at = row[0]
-        r = c.execute("""SELECT id FROM runs
-                         WHERE approved=1 AND created_at < ?
-                         ORDER BY created_at DESC LIMIT 1""", (created_at,)).fetchone()
-        if r:
-            return r[0]
-        r = c.execute("""SELECT id FROM runs
-                         WHERE created_at < ?
-                         ORDER BY created_at DESC LIMIT 1""", (created_at,)).fetchone()
-        return r[0] if r else None
-
-def _baseline_candidates(current_created_at: str, limit:int=100) -> List[dict]:
-    with sqlite3.connect(DB_PATH) as c:
-        rows = c.execute(
-            """SELECT id,created_at,approved,p50,p95,p99,stdev,count
-               FROM runs
-               WHERE created_at < ?
-               ORDER BY created_at DESC
-               LIMIT ?""",
-            (current_created_at, int(limit))
-        ).fetchall()
-    keys=("id","created_at","approved","p50","p95","p99","stdev","count")
-    return [dict(zip(keys,r)) for r in rows]
-
-# ─── Routes ──────────────────────────────────────────────────────────────────
-@app.get("/", response_class=HTMLResponse)
-def list_runs(request: Request):
-    with sqlite3.connect(DB_PATH) as c:
-        rows=c.execute("SELECT * FROM runs ORDER BY created_at DESC").fetchall()
-    return templates.TemplateResponse("list.html", {"request":request,"runs":[_row_to_dict(r) for r in rows]})
-
-@app.get("/approved", response_class=HTMLResponse)
-def approved(request: Request):
-    with sqlite3.connect(DB_PATH) as c:
-        rows=c.execute("SELECT * FROM runs WHERE approved=1 ORDER BY created_at DESC").fetchall()
-    return templates.TemplateResponse("list.html", {"request":request,"runs":[_row_to_dict(r) for r in rows]})
-
-@app.get("/runs/latest")
-def latest_redirect():
-    with sqlite3.connect(DB_PATH) as c:
-        row=c.execute("SELECT id FROM runs ORDER BY created_at DESC LIMIT 1").fetchone()
-    if not row: raise HTTPException(404,"No runs")
-    return RedirectResponse(f"/runs/{row[0]}", status_code=303)
-
-@app.get("/runs/{run_id}", response_class=HTMLResponse)
-def show_run(request: Request, run_id:str, filter: str = FILTER_DEFAULT):
-    with sqlite3.connect(DB_PATH) as c:
-        row=c.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
-    if not row: raise HTTPException(404)
-    d=_row_to_dict(row)
-
-    # Load CSV (raw)
-    csv_path=CSV_DIR/d["filename"]
-    if not csv_path.exists(): raise HTTPException(500,"CSV missing")
-    df=pd.read_csv(csv_path, skipinitialspace=True,
-        names=["entry_id","ingress","egress","latency_ns"], header=0,
-        dtype={"ingress":"int64","latency_ns":"int64"}, engine="python").sort_values("ingress")
-    df["ingress_dt"]=pd.to_datetime(df["ingress"], unit="ns", utc=True)
-
-    # Apply filter policy for metrics/CDF
-    df_f, filt_info = _apply_filters(df, filter)
-
-    # Raw plot data (current only — unfiltered)
-    x_json=json.dumps(df["ingress_dt"].dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ").tolist())
-    y_json=json.dumps(df["latency_ns"].tolist())
-
-    # Per-second quantiles (filtered)
-    sec_iso,p50s,p95s,p99s=_per_second_quantiles(df_f)
-
-    # Rollups for current run (filtered)
-    stats = _summary_stats(df_f["latency_ns"])
-
-    # CDF (filtered)
-    points = 300
-    lat_f = pd.to_numeric(df_f["latency_ns"], errors="coerce").dropna()
-    if lat_f.empty:
-        ps, qs = [], []
-    else:
-        ps = [(i+1)/(points+1) for i in range(points)]
-        qs = lat_f.quantile(ps).astype(float).tolist()
-
-    # Baseline options & auto-select
-    baseline_default = _find_default_baseline_id(run_id) or ""
-    baseline_runs    = _baseline_candidates(d["created_at"], limit=100)
-
-    return templates.TemplateResponse("detail.html",
-        {"request":request, **d,
-         "x_json":x_json, "y_json":y_json,
-         "sec_json":json.dumps(sec_iso),
-         "p50_json":json.dumps(p50s),
-         "p95_json":json.dumps(p95s),
-         "p99_json":json.dumps(p99s),
-         "baseline_default": baseline_default,
-         "baseline_runs": baseline_runs,
-         "stats_json": json.dumps(stats),
-         "cdf_p_json": json.dumps(ps),
-         "cdf_q_json": json.dumps(qs),
-         "rules_json": json.dumps(INTERPRETATION_RULES),
-         "filter_info_json": json.dumps(filt_info)})
-
-@app.post("/runs/{run_id}/approve")
-def approve(run_id:str, user:str=Form("anon")):
-    now=dt.datetime.utcnow().isoformat()
-    with sqlite3.connect(DB_PATH) as c:
-        changed=c.execute("UPDATE runs SET approved=1,approved_by=?,approved_at=? WHERE id=? AND approved=0",
-                          (user,now,run_id)).rowcount
-    if changed==0: raise HTTPException(409,"already approved or missing")
-    return RedirectResponse(f"/runs/{run_id}", status_code=303)
-
-@app.post("/runs/{run_id}/unapprove")
-def unapprove(run_id:str):
-    with sqlite3.connect(DB_PATH) as c:
-        changed=c.execute("UPDATE runs SET approved=0,approved_by=NULL,approved_at=NULL WHERE id=? AND approved=1",
-                          (run_id,)).rowcount
-    if changed==0: raise HTTPException(409,"not approved or missing")
-    return RedirectResponse(f"/runs/{run_id}", status_code=303)
-
-@app.get("/runs/{run_id}/status")
-def status(run_id:str):
-    with sqlite3.connect(DB_PATH) as c:
-        row=c.execute("SELECT approved FROM runs WHERE id=?", (run_id,)).fetchone()
-    if not row: raise HTTPException(404)
-    return {"run_id":run_id,"approved":bool(row[0])}
-
-@app.get("/logs", response_class=PlainTextResponse)
-def view_logs(lines:int=1000):
-    try:
-        with open(LOG_FILE,"r",encoding="utf-8") as f:
-            return PlainTextResponse("".join(f.readlines()[-lines:]))
-    except FileNotFoundError: raise HTTPException(404,"log missing")
-
-# ─── JSON for overlays/compare ────────────────────────────────────────────────
-@app.get("/runs/{run_id}/cdf_json")
-def cdf_json(run_id:str, points:int=300, filter: str = FILTER_DEFAULT):
-    points = max(50, min(int(points), 2000))
-    meta = _load_run_meta(run_id)
-    df   = _load_run_df_by_meta(meta)
-    df_f, _info = _apply_filters(df, filter)
-    lat  = pd.to_numeric(df_f["latency_ns"], errors="coerce").dropna()
-    if lat.empty:
-        return {"run_id":run_id,"p":[],"q_ns":[],"filter":filter}
-    ps   = [(i+1)/(points+1) for i in range(points)]
-    qs   = lat.quantile(ps).astype(float).tolist()
-    return {"run_id":run_id,"p":ps,"q_ns":qs,"filter":filter}
-
-def _exceedance_significance(cur_lat: pd.Series, base: Dict[str,float]) -> Dict[str, Dict[str, float]]:
-    """For each quantile q in {0.5,0.95,0.99,0.999}, compute fraction of current
-       samples exceeding the baseline threshold, and a binomial z-score vs expected (1-q)."""
-    res = {}
-    if cur_lat is None or cur_lat.size == 0:
-        for k in ("p50","p95","p99","p999"):
-            res[k] = {"threshold_ns": float('nan'), "above_frac": float('nan'),
-                      "expected_above": float('nan'), "z": None, "n": 0}
-        return res
-    mapping = {"p50":0.5,"p95":0.95,"p99":0.99,"p999":0.999}
-    lat = pd.to_numeric(cur_lat, errors="coerce").dropna()
-    n = int(lat.size)
-    for k,q in mapping.items():
-        thr = float(base.get(k, float('nan')))
-        if pd.isna(thr) or n == 0:
-            res[k] = {"threshold_ns": float('nan'), "above_frac": float('nan'),
-                      "expected_above": float('nan'), "z": None, "n": n}
-            continue
-        above = float((lat > thr).mean()) if n>0 else float('nan')
-        p0 = 1.0 - q
-        se = (p0*(1.0-p0)/n)**0.5 if n>0 else float('nan')
-        z  = ((above - p0)/se) if (se and se>0) else None
-        res[k] = {"threshold_ns": thr, "above_frac": above,
-                  "expected_above": p0, "z": z, "n": n}
-    return res
-
-@app.get("/runs/{run_id}/compare")
-def compare_runs(run_id:str, baseline_id:str, filter: str = FILTER_DEFAULT):
-    base_meta = _load_run_meta(baseline_id)
-    cur_meta  = _load_run_meta(run_id)
-    base_df   = _load_run_df_by_meta(base_meta)
-    cur_df    = _load_run_df_by_meta(cur_meta)
-
-    base_df_f, base_info = _apply_filters(base_df, filter)
-    cur_df_f,  cur_info  = _apply_filters(cur_df,  filter)
-
-    base = _summary_stats(base_df_f["latency_ns"])
-    cur  = _summary_stats(cur_df_f["latency_ns"])
-
-    def diff(a:float,b:float):
-        if b == 0:
-            return {"abs": a-b, "pct": None}
-        return {"abs": a-b, "pct": (a-b)/b*100.0}
-
-    metrics = ["p50","p95","p99","p999","stdev","madn","iqr","mean","outlier_rate","count"]
-    delta = {m: diff(cur.get(m,0.0), base.get(m,0.0)) for m in metrics}
-
-    significance = _exceedance_significance(cur_df_f["latency_ns"], base)
-
-    return {
-        "run_id":run_id, "baseline_id":baseline_id,
-        "filter": filter,
-        "current":cur, "baseline":base, "delta":delta,
-        "significance": significance,
-        "counts": {"current_used": int(cur_info["n_used"]), "baseline_used": int(base_info["n_used"])}
-    }
-
-
-
-
-
-
-
-
 {% extends 'base.html' %}{% block title %}Run {{ id }}{% endblock %}
 {% block content %}
 <style>
@@ -429,10 +7,10 @@ def compare_runs(run_id:str, baseline_id:str, filter: str = FILTER_DEFAULT):
   .metric-row { display:flex; flex-wrap:wrap; gap:.5rem .75rem; }
 
   .delta-chip { padding:.25rem .5rem; border-radius:.5rem; font-weight:600; display:inline-flex; gap:.35rem; align-items:center; border:1px solid var(--bs-border-color); }
-  /* Keep green for improvements and amber for warnings; no red/escalate state */
-  .delta-down    { color:#0f5132; background:#d1e7dd; }   /* improvement */
-  .delta-watch   { color:#664d03; background:#fff3cd; }   /* warning */
-  .delta-unknown { color:var(--bs-secondary-color); background:var(--bs-tertiary-bg); }  /* neutral */
+  /* All OK = green; WATCH = brighter orange */
+  .delta-down    { color:#0f5132; background:#d1e7dd; }   /* OK (green) */
+  .delta-watch   { color:#7a4100; background:#ffdd99; }   /* WATCH (bright orange) */
+  .delta-unknown { color:var(--bs-secondary-color); background:var(--bs-tertiary-bg); }  /* n/a */
 
   .card-clean { border:1px solid var(--bs-border-color); border-radius:.5rem; }
   .card-clean .card-header { background:transparent; border-bottom:1px solid var(--bs-border-color); }
@@ -503,7 +81,7 @@ def compare_runs(run_id:str, baseline_id:str, filter: str = FILTER_DEFAULT):
     <button class="nav-link active" id="tab-cdf" data-bs-toggle="tab" data-bs-target="#pane-cdf" type="button" role="tab">Distribution (CDF)</button>
   </li>
   <li class="nav-item" role="presentation">
-    <button class="nav-link" id="tab-quant" data-bs-toggle="tab" data-bs-target="#pane-quant" type="button" role="tab">Per‑second Quantiles</button>
+    <button class="nav-link" id="tab-quant" data-bs-toggle="tab" data-bs-target="#pane-quant" type="button" role="tab">Per-second Quantiles</button>
   </li>
   <li class="nav-item" role="presentation">
     <button class="nav-link" id="tab-raw" data-bs-toggle="tab" data-bs-target="#pane-raw" type="button" role="tab">Raw Messages</button>
@@ -552,7 +130,7 @@ def compare_runs(run_id:str, baseline_id:str, filter: str = FILTER_DEFAULT):
 <div class="card card-clean mt-4">
   <div class="card-header"><strong>Interpretation guide (advisory)</strong></div>
   <div class="card-body">
-    <div class="row row-cols-1 row-cols-lg-2 g-3">
+    <div class="row row-cols-1 g-3">
       <div>
         <table class="table table-sm">
           <thead class="table-light">
@@ -560,13 +138,6 @@ def compare_runs(run_id:str, baseline_id:str, filter: str = FILTER_DEFAULT):
           </thead>
           <tbody id="guide-table"></tbody>
         </table>
-      </div>
-      <div class="small text-muted">
-        <p class="mb-0">
-          Warnings are raised when the relative change vs. the selected baseline exceeds the threshold,
-          the absolute change exceeds a floor (ns or pp), and—where applicable—the exceedance test is
-          statistically significant (binomial <em>z</em> ≥ threshold). No automatic rejection; approval is manual.
-        </p>
       </div>
     </div>
   </div>
@@ -577,7 +148,7 @@ def compare_runs(run_id:str, baseline_id:str, filter: str = FILTER_DEFAULT):
   <div class="alert alert-success mt-4 d-flex justify-content-between align-items-center">
     <span>Approved by <b>{{ approved_by }}</b> at {{ approved_at[:19] }} UTC</span>
     <form action="/runs/{{ id }}/unapprove" method="post">
-      <button class="btn btn-outline-danger btn-sm" data-bs-toggle="tooltip" title="Mark this run as not approved">Un‑approve</button>
+      <button class="btn btn-outline-danger btn-sm" data-bs-toggle="tooltip" title="Mark this run as not approved">Un-approve</button>
     </form>
   </div>
 {% else %}
@@ -716,7 +287,7 @@ def compare_runs(run_id:str, baseline_id:str, filter: str = FILTER_DEFAULT):
     note.textContent = `Filter=${FILTER_MODE_DEFAULT}. Baseline overlay uses the same filter.`;
   }
 
-  // ✅ Ensure toggle works
+  // Ensure toggle works
   document.getElementById('toggleBaselineCDF').addEventListener('change', renderCDF);
 
   // ---------- Quantiles & Raw (render on first tab show for sizing)
@@ -738,7 +309,7 @@ def compare_runs(run_id:str, baseline_id:str, filter: str = FILTER_DEFAULT):
     }
   });
 
-  // ---------- Baseline selection + deltas (warn-only severity)
+  // ---------- Baseline selection + deltas (all OK = green; WATCH = orange)
   function chip(el, text, cls){ el.textContent = text; el.className = `delta-chip ${cls}`; }
 
   function severityFor(metricKey, delta, sig){
@@ -758,7 +329,7 @@ def compare_runs(run_id:str, baseline_id:str, filter: str = FILTER_DEFAULT):
     const pctAbs = Math.abs(delta.pct==null ? 0 : delta.pct);
     const pctOK = pctAbs >= (r.warn ?? Infinity);
 
-    // Significance gate via exceedance test (for percentile metrics)
+    // Significance gate (percentile metrics)
     let z = null, zOK = true;
     if (sig && typeof sig.z === 'number' && r.z_warn!=null){
       z = Math.abs(sig.z);
@@ -772,17 +343,13 @@ def compare_runs(run_id:str, baseline_id:str, filter: str = FILTER_DEFAULT):
   function paintDelta(elId, metricKey, delta, sig){
     const el = document.getElementById(elId);
     if (!delta){ chip(el, `${RULES[metricKey].label}: n/a`, 'delta-unknown'); return; }
-    const lowerIsBetter = new Set(['p50','p95','p99','p999','outlier_rate']);
 
     const pctText = (delta.pct==null || isNaN(delta.pct)) ? '' : ` (${delta.pct.toFixed(2)}%)`;
     const absVal = metricKey==='outlier_rate' ? (delta.abs*100).toFixed(2) + ' pp'
                                               : Math.round(delta.abs) + ' ns';
 
-    const isRegression = lowerIsBetter.has(metricKey) ? (delta.abs>0) : (delta.abs<0);
-
     const sev = severityFor(metricKey, delta, sig);
-    // Improvements are green; otherwise WATCH (amber) or neutral
-    const cls = (sev.level==='watch') ? 'delta-watch' : (isRegression ? 'delta-unknown' : 'delta-down');
+    const cls = (sev.level==='watch') ? 'delta-watch' : 'delta-down'; // all OK = green
     const statusLabel = (sev.level==='watch') ? 'WATCH' : 'OK';
     const zTxt = (sig && typeof sig.z === 'number') ? ` • z=${Math.abs(sig.z).toFixed(2)}` : '';
 
@@ -820,7 +387,3 @@ def compare_runs(run_id:str, baseline_id:str, filter: str = FILTER_DEFAULT):
   })();
 </script>
 {% endblock %}
-
-
-
-
