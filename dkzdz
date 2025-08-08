@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
 latency-portal  ◆  nano-latency visualiser
-• Added earlier: un-approve endpoint, ISO-date x-axes, tooltip-ready stats.
-• Now: baseline comparison (server-rendered dropdown & auto-select), CDF plot,
-       robust stats (p99.9, MADn, IQR, outlier rate) + compare deltas table.
+• Adds: baseline comparison (server-rendered dropdown & auto-select), CDF overlay,
+        concise delta summary, robust stats (p99.9, MADn, IQR, outlier rate).
+• No NumPy dependency.
 """
 
 import base64, io, json, logging, pathlib, sqlite3, statistics, datetime as dt
@@ -19,7 +19,7 @@ from fastapi.templating import Jinja2Templates
 CSV_DIR = pathlib.Path("/apps/sp_hfts/latency_csv"); CSV_DIR.mkdir(parents=True, exist_ok=True)
 BASE_DIR = pathlib.Path(__file__).parent
 LOG_FILE = BASE_DIR / "portal.log"
-DB_PATH  = str(CSV_DIR / "runs.db")                     # ensure str
+DB_PATH  = str(CSV_DIR / "runs.db")
 TPL_DIR  = BASE_DIR / "templates"
 
 logging.basicConfig(level=logging.INFO,
@@ -116,7 +116,7 @@ def _summary_stats(lat: pd.Series) -> Dict[str, float]:
     q = lat.quantile([0.5, 0.95, 0.99, 0.999])
     median = float(q.loc[0.5])
     mad = float((lat - median).abs().median())
-    madn = float(1.4826 * mad) if mad > 0 else 0.0   # ≈ σ for normal
+    madn = float(1.4826 * mad) if mad > 0 else 0.0   # robust σ
     iqr  = float(lat.quantile(0.75) - lat.quantile(0.25))
     mean = float(lat.mean())
     stdev = float(statistics.pstdev(lat))
@@ -155,7 +155,6 @@ def _find_default_baseline_id(current_id: str) -> Optional[str]:
         return r[0] if r else None
 
 def _baseline_candidates(current_created_at: str, limit:int=100) -> List[dict]:
-    """All earlier runs to populate the dropdown (server-rendered)."""
     with sqlite3.connect(DB_PATH) as c:
         rows = c.execute(
             """SELECT id,created_at,approved,p50,p95,p99,stdev,count
@@ -203,22 +202,22 @@ def show_run(request: Request, run_id:str):
         dtype={"ingress":"int64","latency_ns":"int64"}, engine="python").sort_values("ingress")
     df["ingress_dt"]=pd.to_datetime(df["ingress"], unit="ns", utc=True)
 
-    # Raw plot data
+    # Raw plot data (current only)
     x_json=json.dumps(df["ingress_dt"].dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ").tolist())
     y_json=json.dumps(df["latency_ns"].tolist())
 
-    # Per-second quantiles
+    # Per-second quantiles (current only)
     sec_iso,p50s,p95s,p99s=_per_second_quantiles(df)
 
     # Robust stats (current run)
     stats = _summary_stats(df["latency_ns"])
 
-    # Current CDF (no numpy required)
+    # Current CDF (no numpy)
     points = 300
     ps = [(i+1)/(points+1) for i in range(points)]
     qs = df["latency_ns"].quantile(ps).astype(float).tolist()
 
-    # Baseline: default + candidates (server-rendered dropdown)
+    # Baseline options & auto-select
     baseline_default = _find_default_baseline_id(run_id) or ""
     baseline_runs    = _baseline_candidates(d["created_at"], limit=100)
 
@@ -266,7 +265,7 @@ def view_logs(lines:int=1000):
             return PlainTextResponse("".join(f.readlines()[-lines:]))
     except FileNotFoundError: raise HTTPException(404,"log missing")
 
-# ─── Comparison & analysis JSON endpoints ────────────────────────────────────
+# ─── Lightweight JSON for overlays/compare ───────────────────────────────────
 @app.get("/runs/{run_id}/per_second_json")
 def per_second_json(run_id:str):
     meta = _load_run_meta(run_id)
@@ -325,185 +324,185 @@ def compare_runs(run_id:str, baseline_id:str):
 
 
 
+
+
+
+
 {% extends 'base.html' %}{% block title %}Run {{ id }}{% endblock %}
 {% block content %}
-<a class="btn btn-link mb-3" href="/">← Back</a>
-<h3>Run {{ id }}</h3><p class="text-muted">{{ created_at[:19] }} UTC</p>
+<style>
+  /* SaaS-like polish without external deps */
+  .page-header { display:flex; justify-content:space-between; align-items:start; gap:1rem; }
+  .page-title { margin:0; }
+  .subtext { color:#6c757d; font-size:.9rem; }
+  .pill { display:inline-flex; align-items:center; gap:.35rem; padding:.25rem .5rem; border-radius:999px; background:#f8f9fa; border:1px solid #e9ecef; font-size:.85rem; }
+  .pill .label { color:#6c757d; }
+  .pill .value { font-weight:600; }
+  .metric-row { display:flex; flex-wrap:wrap; gap:.5rem .75rem; }
+  .card-clean { border:1px solid #e9ecef; border-radius:.5rem; }
+  .card-clean .card-header { background:#fff; border-bottom:1px solid #e9ecef; }
+  .delta-chip { padding:.25rem .5rem; border-radius:.5rem; font-weight:600; }
+  .delta-up { color:#842029; background:#f8d7da; }     /* regression (higher is worse) */
+  .delta-down { color:#0f5132; background:#d1e7dd; }   /* improvement (lower is better) */
+  .muted { color:#6c757d; }
+  .tab-pane { padding-top:1rem; }
+</style>
 
-<!-- Plots -->
-<div id="rawplot" style="height:350px;"></div>
-<div id="quantplot" style="height:350px;" class="mt-5"></div>
-<div id="cdfplot" style="height:350px;" class="mt-5"></div>
-
-<!-- Approval-critical quick chips (original ones preserved) -->
-<div class="row g-3 mt-3">
-  <div class="col-auto"><span class="badge bg-secondary" data-bs-toggle="tooltip"
-        title="50 % of latencies are below this value (median)">P50</span>
-        {{ '%.0f'|format(p50) }} ns</div>
-  <div class="col-auto"><span class="badge bg-secondary" data-bs-toggle="tooltip"
-        title="95th percentile latency">P95</span>
-        {{ '%.0f'|format(p95) }} ns</div>
-  <div class="col-auto"><span class="badge bg-secondary" data-bs-toggle="tooltip"
-        title="99th percentile latency">P99</span>
-        {{ '%.0f'|format(p99) }} ns</div>
-  <div class="col-auto"><span class="badge bg-secondary" data-bs-toggle="tooltip"
-        title="Population standard deviation">σ</span>
-        {{ '%.0f'|format(stdev) }} ns</div>
-  <div class="col-auto"><span class="badge bg-secondary" data-bs-toggle="tooltip"
-        title="Total samples">n</span> {{ count }}</div>
-</div>
-
-<!-- Baseline compare -->
-<div class="card mt-4">
-  <div class="card-body">
-    <div class="row g-3 align-items-center">
-      <div class="col-auto">
-        <label for="baselineSelect" class="col-form-label">Compare to (baseline):</label>
-      </div>
-      <div class="col-auto">
-        <select id="baselineSelect" class="form-select form-select-sm" style="min-width: 360px;">
-          <option value="" {% if not baseline_default %}selected{% endif %}>— none —</option>
-          {% for r in baseline_runs %}
-            <option value="{{ r.id }}" {% if baseline_default and r.id == baseline_default %}selected{% endif %}>
-              {{ r.id }}  •  {{ r.created_at[:19] }} UTC{% if r.approved %} ✓{% endif %}
-            </option>
-          {% endfor %}
-        </select>
-      </div>
-      <div class="col-auto form-check">
-        <input class="form-check-input" type="checkbox" id="toggleBaselineQuant" checked aria-label="Overlay baseline on per-second quantiles">
-        <label class="form-check-label" for="toggleBaselineQuant">Overlay baseline on per-second quantiles</label>
-      </div>
-      <div class="col-auto form-check">
-        <input class="form-check-input" type="checkbox" id="toggleBaselineCDF" checked aria-label="Overlay baseline on CDF">
-        <label class="form-check-label" for="toggleBaselineCDF">Overlay baseline on CDF</label>
-      </div>
+<div class="page-header mb-3">
+  <div>
+    <h3 class="page-title">Run {{ id }}</h3>
+    <div class="subtext">{{ created_at[:19] }} UTC
+      {% if approved %}· <span class="text-success">APPROVED</span>
+      {% else %}· <span class="text-danger">PENDING</span>{% endif %}
+    </div>
+    <!-- Quick key metrics (original set, concise) -->
+    <div class="metric-row mt-2">
+      <span class="pill" data-bs-toggle="tooltip" title="50 % of latencies are below this value (median)">
+        <span class="label">P50</span><span class="value">{{ '%.0f'|format(p50) }} ns</span>
+      </span>
+      <span class="pill" data-bs-toggle="tooltip" title="95th percentile latency">
+        <span class="label">P95</span><span class="value">{{ '%.0f'|format(p95) }} ns</span>
+      </span>
+      <span class="pill" data-bs-toggle="tooltip" title="99th percentile latency">
+        <span class="label">P99</span><span class="value">{{ '%.0f'|format(p99) }} ns</span>
+      </span>
+      <span class="pill" data-bs-toggle="tooltip" title="Population standard deviation">
+        <span class="label">σ</span><span class="value">{{ '%.0f'|format(stdev) }} ns</span>
+      </span>
+      <span class="pill" data-bs-toggle="tooltip" title="Total samples">
+        <span class="label">n</span><span class="value">{{ count }}</span>
+      </span>
     </div>
   </div>
-  <div class="table-responsive">
-    <table class="table table-sm mb-0" id="compare-table">
-      <thead class="table-light">
-        <tr><th>Metric</th><th>Current</th><th>Baseline</th><th>Δ</th><th>Δ%</th></tr>
-      </thead>
-      <tbody></tbody>
-    </table>
+
+  <!-- Baseline selector -->
+  <div>
+    <label class="form-label mb-1">Baseline</label>
+    <select id="baselineSelect" class="form-select form-select-sm" style="min-width: 300px;">
+      <option value="" {% if not baseline_default %}selected{% endif %}>— none —</option>
+      {% for r in baseline_runs %}
+        <option value="{{ r.id }}" {% if baseline_default and r.id == baseline_default %}selected{% endif %}>
+          {{ r.id }} · {{ r.created_at[:19] }} UTC{% if r.approved %} ✓{% endif %}
+        </option>
+      {% endfor %}
+    </select>
+    <div class="form-text">Used for CDF overlay and deltas.</div>
   </div>
 </div>
 
-<!-- Current-run stats with explanations -->
-<div class="card mt-4">
+<!-- Comparison summary (compact) -->
+<div id="delta-summary" class="row g-2 mb-3" style="display:none;">
+  <div class="col-auto"><span class="muted">Δ vs baseline:</span></div>
+  <div class="col-auto"><span id="d-p50"  class="delta-chip"></span></div>
+  <div class="col-auto"><span id="d-p95"  class="delta-chip"></span></div>
+  <div class="col-auto"><span id="d-p99"  class="delta-chip"></span></div>
+  <div class="col-auto"><span id="d-p999" class="delta-chip"></span></div>
+  <div class="col-auto"><span id="d-or"   class="delta-chip"></span></div>
+</div>
+
+<!-- Tabs: Distribution first (most meaningful), then Quantiles & Raw -->
+<ul class="nav nav-tabs" id="viewTabs" role="tablist">
+  <li class="nav-item" role="presentation">
+    <button class="nav-link active" id="tab-cdf" data-bs-toggle="tab" data-bs-target="#pane-cdf" type="button" role="tab">Distribution (CDF)</button>
+  </li>
+  <li class="nav-item" role="presentation">
+    <button class="nav-link" id="tab-quant" data-bs-toggle="tab" data-bs-target="#pane-quant" type="button" role="tab">Per‑second Quantiles</button>
+  </li>
+  <li class="nav-item" role="presentation">
+    <button class="nav-link" id="tab-raw" data-bs-toggle="tab" data-bs-target="#pane-raw" type="button" role="tab">Raw Messages</button>
+  </li>
+</ul>
+
+<div class="tab-content">
+  <div class="tab-pane fade show active" id="pane-cdf" role="tabpanel" aria-labelledby="tab-cdf">
+    <div id="cdfplot" style="height:380px;"></div>
+    <div class="form-check mt-2">
+      <input class="form-check-input" type="checkbox" id="toggleBaselineCDF" checked>
+      <label class="form-check-label" for="toggleBaselineCDF">Overlay baseline on CDF</label>
+    </div>
+  </div>
+  <div class="tab-pane fade" id="pane-quant" role="tabpanel" aria-labelledby="tab-quant">
+    <div id="quantplot" style="height:360px;"></div>
+    <div class="form-text">Current run only (no overlay) — use CDF for baseline comparison.</div>
+  </div>
+  <div class="tab-pane fade" id="pane-raw" role="tabpanel" aria-labelledby="tab-raw">
+    <div id="rawplot" style="height:360px;"></div>
+    <div class="form-text">Dense time series for shape only; not used for approval.</div>
+  </div>
+</div>
+
+<!-- Robust stats with succinct explanations -->
+<div class="card card-clean mt-4">
+  <div class="card-header"><strong>Current run — robust stats</strong></div>
   <div class="card-body">
-    <h6 class="mb-3">Current run — robust stats</h6>
     <div class="row row-cols-2 row-cols-md-3 row-cols-lg-4 g-3" id="current-stats"></div>
-    <details class="mt-3">
+    <details class="mt-2">
       <summary class="small text-muted">What do these mean?</summary>
       <ul class="small mb-0">
-        <li><b>P99.9</b>: 99.9th percentile latency (captures ultra-tail).</li>
-        <li><b>MAD<span style="font-size:0.9em;vertical-align:super;">n</span></b>: robust σ ≈ 1.4826×MAD; less sensitive to outliers than standard deviation.</li>
-        <li><b>IQR</b>: Interquartile range (75th–25th percentile); dispersion of the bulk.</li>
-        <li><b>Outlier rate</b>: Share of samples with robust z-score &gt; 3.5 (Hampel filter proxy).</li>
+        <li><b>P99.9</b>: 99.9th percentile (ultra-tail).</li>
+        <li><b>MAD<span style="font-size:0.8em;vertical-align:super;">n</span></b>: robust σ ≈ 1.4826×MAD (less sensitive to outliers).</li>
+        <li><b>IQR</b>: 75th–25th percentile spread (bulk dispersion).</li>
+        <li><b>Outlier rate</b>: share of samples with robust z-score &gt; 3.5 (Hampel proxy).</li>
       </ul>
     </details>
   </div>
 </div>
 
+<!-- Approval actions (unchanged logic, just placed at end) -->
+{% if approved %}
+  <div class="alert alert-success mt-4 d-flex justify-content-between align-items-center">
+    <span>Approved by <b>{{ approved_by }}</b> at {{ approved_at[:19] }} UTC</span>
+    <form action="/runs/{{ id }}/unapprove" method="post">
+      <button class="btn btn-outline-danger btn-sm" data-bs-toggle="tooltip" title="Mark this run as not approved">Un‑approve</button>
+    </form>
+  </div>
+{% else %}
+  <form class="mt-4" action="/runs/{{ id }}/approve" method="post">
+    <div class="input-group w-auto">
+      <input class="form-control form-control-sm" name="user" placeholder="Your name">
+      <button class="btn btn-success btn-sm">Approve</button>
+    </div>
+  </form>
+{% endif %}
+
 <script>
-// Raw per-message plot
-Plotly.newPlot('rawplot', [{x:{{ x_json|safe }}, y:{{ y_json|safe }},
-  mode:'lines', line:{width:1}}], {
-  title:'Latency per message',
-  margin:{l:40,r:20,t:40,b:40},
-  xaxis:{title:'Ingress time', type:'date'},
-  yaxis:{title:'Latency (ns)'}
-});
+  // -------- Helpers
+  const fmtInt = (v)=> (v===null||v===undefined) ? '–' : Math.round(v).toLocaleString('en');
+  const fmtNs  = (v)=> (v===null||v===undefined) ? '–' : Math.round(v).toLocaleString('en') + ' ns';
+  const fmtPct = (v)=> (v===null||v===undefined) ? '–' : v.toFixed(2) + ' %';
 
-// Per-second quantiles (current)
-Plotly.newPlot('quantplot', [
-  {x:{{ sec_json|safe }}, y:{{ p50_json|safe }}, name:'P50', mode:'lines'},
-  {x:{{ sec_json|safe }}, y:{{ p95_json|safe }}, name:'P95', mode:'lines'},
-  {x:{{ sec_json|safe }}, y:{{ p99_json|safe }}, name:'P99', mode:'lines'}
-], {
-  title:'Per-second quantiles',
-  margin:{l:40,r:20,t:40,b:40},
-  xaxis:{title:'Time (1-s buckets)', type:'date'},
-  yaxis:{title:'Latency (ns)'}
-});
-
-// Precomputed CDF for current run
-const CURRENT_CDF = { p: {{ cdf_p_json|safe }}, q_ns: {{ cdf_q_json|safe }}, run_id: "{{ id }}" };
-
-// Formatters
-const fmtInt = (v)=> (v===null||v===undefined) ? '–' : Math.round(v).toLocaleString('en');
-const fmtNs  = (v)=> (v===null||v===undefined) ? '–' : Math.round(v).toLocaleString('en') + ' ns';
-const fmtPct = (v)=> (v===null||v===undefined) ? '–' : v.toFixed(2) + ' %';
-
-// Render current CDF immediately
-(function renderCurrentCDF(){
-  const data = [{
-    x: CURRENT_CDF.q_ns, y: CURRENT_CDF.p.map(p=>p*100),
-    name: `${CURRENT_CDF.run_id}`, mode:'lines'
-  }];
-  Plotly.newPlot('cdfplot', data, {
-    title:'Latency distribution (CDF)',
-    margin:{l:40,r:20,t:40,b:40},
-    xaxis:{title:'Latency (ns)'},
-    yaxis:{title:'Cumulative (%)', range:[0,100]}
-  });
-})();
-
-// Current-run robust stats
-(function renderCurrentStats(){
-  const s = {{ stats_json|safe }};
-  const items = [
-    {k:'p999',lbl:'P99.9',fmt:fmtNs, tip:'99.9th percentile'},
-    {k:'madn',lbl:'MAD\u2099',fmt:fmtNs, tip:'Robust σ ≈ 1.4826×MAD'},
-    {k:'iqr', lbl:'IQR',  fmt:fmtNs, tip:'75th–25th percentile'},
-    {k:'outlier_rate',lbl:'Outlier rate',fmt:(v)=>fmtPct(v*100), tip:'Robust z > 3.5'},
-    {k:'mean',lbl:'Mean',fmt:fmtNs, tip:'Arithmetic mean'},
-    {k:'stdev',lbl:'σ',fmt:fmtNs, tip:'Population standard deviation'},
-    {k:'min',lbl:'Min',fmt:fmtNs, tip:'Minimum latency'},
-    {k:'max',lbl:'Max',fmt:fmtNs, tip:'Maximum latency'},
-  ];
-  const box = document.getElementById('current-stats');
-  items.forEach(it=>{
-    const v = s[it.k]; const val = it.fmt(v);
-    const div = document.createElement('div');
-    div.innerHTML = `
-      <div class="border rounded p-2 h-100" data-bs-toggle="tooltip" title="${it.tip}">
-        <div class="text-muted small">${it.lbl}</div>
-        <div class="fw-semibold">${val}</div>
-      </div>`;
-    box.appendChild(div);
-  });
-  if (window.bootstrap){
-    [...document.querySelectorAll('[data-bs-toggle="tooltip"]')]
-      .forEach(el=>new bootstrap.Tooltip(el));
-  }
-})();
-
-// Baseline comparison
-(function(){
-  let baselineCDF=null, baselineQuant=null;
-  let quantBaselineTraceIdx = [];
-
-  function clearQuantBaseline(){
-    if (quantBaselineTraceIdx.length){
-      Plotly.deleteTraces('quantplot', quantBaselineTraceIdx);
-      quantBaselineTraceIdx = [];
-    }
-  }
-
-  function maybeOverlayQuantBaseline(){
-    clearQuantBaseline();
-    if (!baselineQuant) return;
-    if (!document.getElementById('toggleBaselineQuant').checked) return;
-    const traces = [
-      {x:baselineQuant.sec, y:baselineQuant.p50, name:'P50 (baseline)', mode:'lines', line:{dash:'dot'}},
-      {x:baselineQuant.sec, y:baselineQuant.p95, name:'P95 (baseline)', mode:'lines', line:{dash:'dot'}},
-      {x:baselineQuant.sec, y:baselineQuant.p99, name:'P99 (baseline)', mode:'lines', line:{dash:'dot'}}
+  // -------- Current-run robust stats
+  (function renderCurrentStats(){
+    const s = {{ stats_json|safe }};
+    const items = [
+      {k:'p999',lbl:'P99.9',fmt:fmtNs, tip:'99.9th percentile'},
+      {k:'madn',lbl:'MAD\u2099',fmt:fmtNs, tip:'Robust σ ≈ 1.4826×MAD'},
+      {k:'iqr', lbl:'IQR',  fmt:fmtNs, tip:'75th–25th percentile'},
+      {k:'outlier_rate',lbl:'Outlier rate',fmt:(v)=>fmtPct(v*100), tip:'Robust z > 3.5'},
+      {k:'mean',lbl:'Mean',fmt:fmtNs, tip:'Arithmetic mean'},
+      {k:'stdev',lbl:'σ',fmt:fmtNs, tip:'Population standard deviation'},
+      {k:'min',lbl:'Min',fmt:fmtNs, tip:'Minimum latency'},
+      {k:'max',lbl:'Max',fmt:fmtNs, tip:'Maximum latency'},
     ];
-    Plotly.addTraces('quantplot', traces).then(idxs => { quantBaselineTraceIdx = idxs; });
-  }
+    const box = document.getElementById('current-stats');
+    items.forEach(it=>{
+      const v = s[it.k]; const val = it.fmt(v);
+      const div = document.createElement('div');
+      div.innerHTML = `
+        <div class="border rounded p-2 h-100" data-bs-toggle="tooltip" title="${it.tip}">
+          <div class="text-muted small">${it.lbl}</div>
+          <div class="fw-semibold">${val}</div>
+        </div>`;
+      box.appendChild(div);
+    });
+    if (window.bootstrap){
+      [...document.querySelectorAll('[data-bs-toggle="tooltip"]')].forEach(el=>new bootstrap.Tooltip(el));
+    }
+  })();
+
+  // -------- CDF (current + optional baseline overlay)
+  const CURRENT_CDF = { p: {{ cdf_p_json|safe }}, q_ns: {{ cdf_q_json|safe }}, run_id: "{{ id }}" };
+  let baselineCDF = null;
 
   function renderCDF(){
     const showBaseline = document.getElementById('toggleBaselineCDF').checked;
@@ -525,99 +524,85 @@ const fmtPct = (v)=> (v===null||v===undefined) ? '–' : v.toFixed(2) + ' %';
     });
   }
 
-  function paintDeltaCell(td, metricKey, cur, base){
-    const lowerIsBetter = new Set(['p50','p95','p99','p999','stdev','madn','iqr','mean','outlier_rate']);
-    const direction = (cur - base);
-    const improved = lowerIsBetter.has(metricKey) ? (direction < 0) : (direction > 0);
-    td.classList.remove('text-success','text-danger');
-    if (direction === 0 || isNaN(direction)) return;
-    td.classList.add(improved ? 'text-success' : 'text-danger');
+  document.getElementById('toggleBaselineCDF').addEventListener('change', renderCDF);
+
+  // -------- Quantiles & Raw (render on first tab show for proper sizing)
+  let quantReady=false, rawReady=false;
+  document.getElementById('viewTabs').addEventListener('shown.bs.tab', (e)=>{
+    const id = e.target.getAttribute('data-bs-target');
+    if (id === '#pane-quant' && !quantReady){
+      Plotly.newPlot('quantplot', [
+        {x:{{ sec_json|safe }}, y:{{ p50_json|safe }}, name:'P50', mode:'lines'},
+        {x:{{ sec_json|safe }}, y:{{ p95_json|safe }}, name:'P95', mode:'lines'},
+        {x:{{ sec_json|safe }}, y:{{ p99_json|safe }}, name:'P99', mode:'lines'}
+      ], {
+        title:'Per-second quantiles (current)',
+        margin:{l:40,r:20,t:40,b:40},
+        xaxis:{title:'Time (1-s buckets)', type:'date'},
+        yaxis:{title:'Latency (ns)'}
+      });
+      quantReady=true;
+    }
+    if (id === '#pane-raw' && !rawReady){
+      Plotly.newPlot('rawplot', [{x:{{ x_json|safe }}, y:{{ y_json|safe }}, mode:'lines', line:{width:1}}], {
+        title:'Latency per message (current)',
+        margin:{l:40,r:20,t:40,b:40},
+        xaxis:{title:'Ingress time', type:'date'},
+        yaxis:{title:'Latency (ns)'}
+      });
+      rawReady=true;
+    }
+  });
+
+  // -------- Baseline selection: overlay CDF + compact delta chips + (optional) table
+  function paintDelta(el, valueAbs, valuePct, lowerIsBetter=true, unit='ns'){
+    if (valueAbs==null || isNaN(valueAbs)) { el.style.display='none'; return; }
+    const regresses = lowerIsBetter ? (valueAbs>0) : (valueAbs<0);
+    el.className = 'delta-chip ' + (regresses ? 'delta-up' : 'delta-down');
+    const arrow = regresses ? '↑' : '↓';
+    const pctTxt = (valuePct==null || isNaN(valuePct)) ? '' : ` (${valuePct.toFixed(2)}%)`;
+    el.textContent = `${arrow} ${Math.round(valueAbs)} ${unit}${pctTxt}`;
+    el.style.display='';
   }
 
-  async function updateCompareTable(){
-    const tbody = document.querySelector('#compare-table tbody');
-    tbody.innerHTML = '';
-    const baselineId = document.getElementById('baselineSelect').value;
-    if (!baselineId){ return; }
-    const cmp = await (await fetch(`/runs/{{ id }}/compare?baseline_id=${baselineId}`)).json();
-    const rows = [
-      {k:'p50', lbl:'P50', fmt:fmtNs},
-      {k:'p95', lbl:'P95', fmt:fmtNs},
-      {k:'p99', lbl:'P99', fmt:fmtNs},
-      {k:'p999',lbl:'P99.9', fmt:fmtNs},
-      {k:'mean',lbl:'Mean', fmt:fmtNs},
-      {k:'stdev',lbl:'σ', fmt:fmtNs},
-      {k:'madn',lbl:'MAD\u2099 (robust σ)', fmt:fmtNs},
-      {k:'iqr', lbl:'IQR', fmt:fmtNs},
-      {k:'outlier_rate', lbl:'Outlier rate', fmt:(v)=>fmtPct(v*100)},
-      {k:'count',lbl:'n', fmt:(v)=>fmtInt(v)}
-    ];
-    rows.forEach(r=>{
-      const tr = document.createElement('tr');
-      const cur = cmp.current[r.k]; const base = cmp.baseline[r.k];
-      const deltaAbs = (cur!=null && base!=null) ? (cur - base) : null;
-      const deltaPct = (cmp.delta[r.k] && cmp.delta[r.k].pct!=null) ? cmp.delta[r.k].pct : null;
-      tr.innerHTML = `<td>${r.lbl}</td>
-                      <td>${r.fmt(cur)}</td>
-                      <td>${r.fmt(base)}</td>
-                      <td>${r.fmt(deltaAbs)}</td>
-                      <td>${deltaPct==null?'–':deltaPct.toFixed(2)+' %'}</td>`;
-      tbody.appendChild(tr);
-      paintDeltaCell(tr.children[3], r.k, cur, base);
-      paintDeltaCell(tr.children[4], r.k, cur, base);
-    });
-  }
-
-  async function loadBaseline(id){
-    if (!id){
-      baselineQuant = null; baselineCDF = null;
-      clearQuantBaseline(); renderCDF(); updateCompareTable();
+  async function updateComparison(baselineId){
+    const summary = document.getElementById('delta-summary');
+    if (!baselineId){
+      baselineCDF = null; renderCDF(); summary.style.display='none';
       return;
     }
-    const [q, c] = await Promise.all([
-      fetch(`/runs/${id}/per_second_json`).then(r=>r.json()),
-      fetch(`/runs/${id}/cdf_json?points=300`).then(r=>r.json()),
-    ]);
-    baselineQuant = q; baselineCDF = c;
-    maybeOverlayQuantBaseline();
+    // fetch CDF for overlay
+    baselineCDF = await (await fetch(`/runs/${baselineId}/cdf_json?points=300`)).json();
     renderCDF();
-    updateCompareTable();
+
+    // fetch deltas
+    const cmp = await (await fetch(`/runs/{{ id }}/compare?baseline_id=${baselineId}`)).json();
+    summary.style.display='flex';
+
+    // p50/p95/p99/p999 deltas (lower is better)
+    paintDelta(document.getElementById('d-p50'),  cmp.delta.p50.abs,  cmp.delta.p50.pct,  true, 'ns');
+    paintDelta(document.getElementById('d-p95'),  cmp.delta.p95.abs,  cmp.delta.p95.pct,  true, 'ns');
+    paintDelta(document.getElementById('d-p99'),  cmp.delta.p99.abs,  cmp.delta.p99.pct,  true, 'ns');
+    paintDelta(document.getElementById('d-p999'), cmp.delta.p999.abs, cmp.delta.p999.pct, true, 'ns');
+    // outlier rate (lower is better) – show as percentage
+    const orAbsPct = (cmp.delta.outlier_rate.abs ?? 0) * 100;
+    const orPctPct = (cmp.delta.outlier_rate.pct==null) ? null : cmp.delta.outlier_rate.pct;
+    paintDelta(document.getElementById('d-or'), orAbsPct, orPctPct, true, '%');
   }
 
-  // Wire UI
-  document.getElementById('toggleBaselineQuant').addEventListener('change', ()=> {
-    maybeOverlayQuantBaseline();
-  });
-  document.getElementById('toggleBaselineCDF').addEventListener('change', ()=> {
-    renderCDF();
-  });
-  document.getElementById('baselineSelect').addEventListener('change', (e)=> loadBaseline(e.target.value));
+  const sel = document.getElementById('baselineSelect');
+  sel.addEventListener('change', (e)=> updateComparison(e.target.value));
 
   // Auto-load default baseline if present
-  (function initAutoBaseline(){
-    const sel = document.getElementById('baselineSelect');
-    if (sel && sel.value){ loadBaseline(sel.value); }
-  })();
-})();
-</script>
+  {% if baseline_default %}
+    updateComparison("{{ baseline_default }}");
+  {% endif %}
 
-{% if approved %}
-  <div class="alert alert-success mt-4 d-flex justify-content-between">
-    <span>Approved by <b>{{ approved_by }}</b> at {{ approved_at[:19] }} UTC</span>
-    <form action="/runs/{{ id }}/unapprove" method="post">
-      <button class="btn btn-outline-danger btn-sm" data-bs-toggle="tooltip"
-              title="Mark this run as not approved">Un-approve</button>
-    </form>
-  </div>
-{% else %}
-  <form class="mt-4" action="/runs/{{ id }}/approve" method="post">
-    <div class="input-group w-auto">
-      <input class="form-control form-control-sm" name="user" placeholder="Your name">
-      <button class="btn btn-success btn-sm">Approve</button>
-    </div>
-  </form>
-{% endif %}
+  // Initialize CDF immediately (without baseline)
+  renderCDF();
+</script>
 {% endblock %}
+
 
 
 
