@@ -7,7 +7,6 @@ latency-portal  ◆  nano-latency visualiser
 
 import base64, io, json, logging, pathlib, sqlite3, statistics, datetime as dt
 from typing import List, Tuple, Optional, Dict
-import numpy as np
 import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
@@ -116,7 +115,7 @@ def _summary_stats(lat: pd.Series) -> Dict[str, float]:
     q = lat.quantile([0.5, 0.95, 0.99, 0.999])
     median = float(q.loc[0.5])
     mad = float((lat - median).abs().median())
-    madn = float(1.4826 * mad) if mad > 0 else 0.0
+    madn = float(1.4826 * mad) if mad > 0 else 0.0   # ≈ σ for normal
     iqr  = float(lat.quantile(0.75) - lat.quantile(0.25))
     mean = float(lat.mean())
     stdev = float(statistics.pstdev(lat))
@@ -186,10 +185,26 @@ def show_run(request: Request, run_id:str):
         names=["entry_id","ingress","egress","latency_ns"], header=0,
         dtype={"ingress":"int64","latency_ns":"int64"}, engine="python").sort_values("ingress")
     df["ingress_dt"]=pd.to_datetime(df["ingress"], unit="ns", utc=True)
+
+    # Raw plot data
     x_json=json.dumps(df["ingress_dt"].dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ").tolist())
     y_json=json.dumps(df["latency_ns"].tolist())
+
+    # Per-second quantiles
     sec_iso,p50s,p95s,p99s=_per_second_quantiles(df)
+
+    # Robust stats (current run)
+    stats = _summary_stats(df["latency_ns"])
+
+    # CDF for current run (no extra dependency, computed here)
+    points = 300
+    ps = [(i+1)/(points+1) for i in range(points)]  # 0..1 (exclusive)
+    qs = df["latency_ns"].quantile(ps).astype(float).tolist()
+    cdf_p_json = json.dumps(ps)
+    cdf_q_json = json.dumps(qs)
+
     baseline_default = _find_default_baseline_id(run_id)
+
     return templates.TemplateResponse("detail.html",
         {"request":request, **d,
          "x_json":x_json, "y_json":y_json,
@@ -197,7 +212,10 @@ def show_run(request: Request, run_id:str):
          "p50_json":json.dumps(p50s),
          "p95_json":json.dumps(p95s),
          "p99_json":json.dumps(p99s),
-         "baseline_default": baseline_default})
+         "baseline_default": baseline_default or "",
+         "stats_json": json.dumps(stats),
+         "cdf_p_json": cdf_p_json,
+         "cdf_q_json": cdf_q_json})
 
 @app.post("/runs/{run_id}/approve")
 def approve(run_id:str, user:str=Form("anon")):
@@ -232,7 +250,8 @@ def view_logs(lines:int=1000):
 
 # ─── Comparison & analysis JSON endpoints ────────────────────────────────────
 @app.get("/runs/options")
-def run_options(before_id: Optional[str]=None, limit:int=20):
+def run_options(before_id: Optional[str]=None, limit:int=30):
+    """Return candidate baseline runs (earlier than `before_id` if provided)."""
     cutoff = None
     if before_id:
         with sqlite3.connect(DB_PATH) as c:
@@ -264,14 +283,16 @@ def summary_json(run_id:str):
     return s
 
 @app.get("/runs/{run_id}/cdf_json")
-def cdf_json(run_id:str, points:int=200):
+def cdf_json(run_id:str, points:int=300):
     points = max(50, min(int(points), 2000))
     meta = _load_run_meta(run_id)
     df   = _load_run_df_by_meta(meta)
-    lat  = df["latency_ns"].dropna()
-    ps   = np.linspace(0.001, 0.999, points)
+    lat  = pd.to_numeric(df["latency_ns"], errors="coerce").dropna()
+    if lat.empty:
+        return {"run_id":run_id,"p":[],"q_ns":[]}
+    ps   = [(i+1)/(points+1) for i in range(points)]
     qs   = lat.quantile(ps).astype(float).tolist()
-    return {"run_id":run_id,"p":ps.tolist(),"q_ns":qs}
+    return {"run_id":run_id,"p":ps,"q_ns":qs}
 
 @app.get("/runs/{run_id}/compare")
 def compare_runs(run_id:str, baseline_id:str):
@@ -281,10 +302,12 @@ def compare_runs(run_id:str, baseline_id:str):
     cur_df    = _load_run_df_by_meta(cur_meta)
     base = _summary_stats(base_df["latency_ns"])
     cur  = _summary_stats(cur_df["latency_ns"])
+
     def diff(a:float,b:float):
         if b == 0:
             return {"abs": a-b, "pct": None}
         return {"abs": a-b, "pct": (a-b)/b*100.0}
+
     metrics = ["p50","p95","p99","p999","stdev","madn","iqr","mean","outlier_rate","count"]
     delta = {m: diff(cur.get(m,0.0), base.get(m,0.0)) for m in metrics}
     return {"run_id":run_id, "baseline_id":baseline_id,
@@ -308,10 +331,14 @@ def compare_runs(run_id:str, baseline_id:str):
 
 
 
+
 {% extends 'base.html' %}{% block title %}Run {{ id }}{% endblock %}
 {% block content %}
 <a class="btn btn-link mb-3" href="/">← Back</a>
 <h3>Run {{ id }}</h3><p class="text-muted">{{ created_at[:19] }} UTC</p>
+
+<!-- Hidden data holder for JS (avoids JSON filter issues) -->
+<div id="page-data" data-run="{{ id }}" data-baseline="{{ baseline_default }}"></div>
 
 <div id="rawplot" style="height:350px;"></div>
 <div id="quantplot" style="height:350px;" class="mt-5"></div>
@@ -348,6 +375,14 @@ def compare_runs(run_id:str, baseline_id:str):
   </div>
 </div>
 
+<!-- Current-run stats (always visible, no baseline needed) -->
+<div class="card mt-4">
+  <div class="card-body">
+    <h6 class="mb-3">Current run — robust stats</h6>
+    <div class="row row-cols-2 row-cols-md-3 row-cols-lg-4 g-3" id="current-stats"></div>
+  </div>
+</div>
+
 <script>
 // Raw per-message plot
 Plotly.newPlot('rawplot', [{x:{{ x_json|safe }}, y:{{ y_json|safe }},
@@ -370,56 +405,67 @@ Plotly.newPlot('quantplot', [
   yaxis:{title:'Latency (ns)'}
 });
 
-// Comparison UI & CDF rendering
+// Precomputed CDF for current run (no fetch needed)
+const CURRENT_CDF = { p: {{ cdf_p_json|safe }}, q_ns: {{ cdf_q_json|safe }}, run_id: "{{ id }}" };
+
+// Helpers
+const pd = document.getElementById('page-data');
+const CURRENT_ID = pd.dataset.run;
+const BASELINE_DEFAULT = pd.dataset.baseline || null;
+
+const fmtInt = (v)=> (v===null||v===undefined) ? '–' : Math.round(v).toLocaleString('en');
+const fmtNs  = (v)=> (v===null||v===undefined) ? '–' : Math.round(v).toLocaleString('en') + ' ns';
+const fmtPct = (v)=> (v===null||v===undefined) ? '–' : v.toFixed(2) + ' %';
+
+// Render current CDF immediately
+(function renderCurrentCDF(){
+  const data = [{
+    x: CURRENT_CDF.q_ns, y: CURRENT_CDF.p.map(p=>p*100),
+    name: `${CURRENT_CDF.run_id}`, mode:'lines'
+  }];
+  Plotly.newPlot('cdfplot', data, {
+    title:'Latency distribution (CDF)',
+    margin:{l:40,r:20,t:40,b:40},
+    xaxis:{title:'Latency (ns)'},
+    yaxis:{title:'Cumulative (%)', range:[0,100]}
+  });
+})();
+
+// Current-run robust stats
+(function renderCurrentStats(){
+  const s = {{ stats_json|safe }};
+  const items = [
+    {k:'p999',lbl:'P99.9',fmt:fmtNs, tip:'99.9th percentile'},
+    {k:'madn',lbl:'MAD\u2099',fmt:fmtNs, tip:'Robust σ (1.4826·MAD)'},
+    {k:'iqr', lbl:'IQR',  fmt:fmtNs, tip:'75th–25th percentile'},
+    {k:'outlier_rate',lbl:'Outlier rate',fmt:(v)=>fmtPct(v*100), tip:'Robust z > 3.5'},
+    {k:'mean',lbl:'Mean',fmt:fmtNs, tip:'Arithmetic mean'},
+    {k:'stdev',lbl:'σ',fmt:fmtNs, tip:'Population standard deviation'},
+    {k:'min',lbl:'Min',fmt:fmtNs, tip:'Minimum latency'},
+    {k:'max',lbl:'Max',fmt:fmtNs, tip:'Maximum latency'},
+  ];
+  const box = document.getElementById('current-stats');
+  items.forEach(it=>{
+    const v = s[it.k]; const val = it.fmt(v);
+    const div = document.createElement('div');
+    div.innerHTML = `
+      <div class="border rounded p-2 h-100" data-bs-toggle="tooltip" title="${it.tip}">
+        <div class="text-muted small">${it.lbl}</div>
+        <div class="fw-semibold">${val}</div>
+      </div>`;
+    box.appendChild(div);
+  });
+  // activate tooltips if not already
+  if (window.bootstrap){
+    [...document.querySelectorAll('[data-bs-toggle="tooltip"]')]
+      .forEach(el=>new bootstrap.Tooltip(el));
+  }
+})();
+
+// Baseline comparison UI
 (function(){
-  const CURRENT_ID = "{{ id }}";
-  const BASELINE_DEFAULT = {{ baseline_default and ('"%s"' % baseline_default)|safe or 'null' }};
-  let currentCDF=null, baselineCDF=null, baselineQuant=null;
-  let quantBaselineTraceIdx = []; // indices of added baseline traces
-
-  const fmtInt = (v)=> (v===null||v===undefined) ? '–' : Math.round(v).toLocaleString('en');
-  const fmtNs  = (v)=> (v===null||v===undefined) ? '–' : Math.round(v).toLocaleString('en') + ' ns';
-  const fmtPct = (v)=> (v===null||v===undefined) ? '–' : v.toFixed(2) + ' %';
-
-  async function populateBaselineOptions(){
-    const res = await (await fetch(`/runs/options?before_id=${CURRENT_ID}&limit=30`)).json();
-    const sel = document.getElementById('baselineSelect');
-    res.runs.forEach(r=>{
-      const label = `${r.id}  •  ${r.created_at.slice(0,19)} UTC  ${r.approved?'✓':''}`;
-      const opt = new Option(label, r.id);
-      sel.add(opt);
-    });
-    if (BASELINE_DEFAULT){
-      sel.value = BASELINE_DEFAULT;
-    }
-  }
-
-  async function ensureCurrentCDF(){
-    if (!currentCDF){
-      currentCDF = await (await fetch(`/runs/${CURRENT_ID}/cdf_json?points=300`)).json();
-    }
-  }
-
-  function renderCDF(){
-    if (!currentCDF){ return; }
-    const data = [{
-      x: currentCDF.q_ns, y: currentCDF.p.map(p=>p*100),
-      name: `${CURRENT_ID}`, mode:'lines'
-    }];
-    const showBaseline = document.getElementById('toggleBaselineCDF').checked;
-    if (baselineCDF && showBaseline){
-      data.push({
-        x: baselineCDF.q_ns, y: baselineCDF.p.map(p=>p*100),
-        name: `${baselineCDF.run_id} (baseline)`, mode:'lines', line:{dash:'dot'}
-      });
-    }
-    Plotly.react('cdfplot', data, {
-      title:'Latency distribution (CDF)',
-      margin:{l:40,r:20,t:40,b:40},
-      xaxis:{title:'Latency (ns)'},
-      yaxis:{title:'Cumulative (%)', range:[0,100]}
-    });
-  }
+  let baselineCDF=null, baselineQuant=null;
+  let quantBaselineTraceIdx = [];
 
   function clearQuantBaseline(){
     if (quantBaselineTraceIdx.length){
@@ -438,6 +484,26 @@ Plotly.newPlot('quantplot', [
       {x:baselineQuant.sec, y:baselineQuant.p99, name:'P99 (baseline)', mode:'lines', line:{dash:'dot'}}
     ];
     Plotly.addTraces('quantplot', traces).then(idxs => { quantBaselineTraceIdx = idxs; });
+  }
+
+  function renderCDF(){
+    const showBaseline = document.getElementById('toggleBaselineCDF').checked;
+    const data = [{
+      x: CURRENT_CDF.q_ns, y: CURRENT_CDF.p.map(p=>p*100),
+      name: `${CURRENT_CDF.run_id}`, mode:'lines'
+    }];
+    if (baselineCDF && showBaseline){
+      data.push({
+        x: baselineCDF.q_ns, y: baselineCDF.p.map(p=>p*100),
+        name: `${baselineCDF.run_id} (baseline)`, mode:'lines', line:{dash:'dot'}
+      });
+    }
+    Plotly.react('cdfplot', data, {
+      title:'Latency distribution (CDF)',
+      margin:{l:40,r:20,t:40,b:40},
+      xaxis:{title:'Latency (ns)'},
+      yaxis:{title:'Cumulative (%)', range:[0,100]}
+    });
   }
 
   function paintDeltaCell(td, metricKey, cur, base){
@@ -479,7 +545,6 @@ Plotly.newPlot('quantplot', [
                       <td>${r.fmt(deltaAbs)}</td>
                       <td>${deltaPct==null?'–':deltaPct.toFixed(2)+' %'}</td>`;
       tbody.appendChild(tr);
-      // color delta cells: green if improvement, red if regression
       paintDeltaCell(tr.children[3], r.k, cur, base);
       paintDeltaCell(tr.children[4], r.k, cur, base);
     });
@@ -508,11 +573,23 @@ Plotly.newPlot('quantplot', [
     renderCDF();
   });
 
+  async function populateBaselineOptions(){
+    const res = await (await fetch(`/runs/options?before_id=${CURRENT_ID}&limit=50`)).json();
+    const sel = document.getElementById('baselineSelect');
+    res.runs.forEach(r=>{
+      const label = `${r.id}  •  ${r.created_at.slice(0,19)} UTC  ${r.approved?'✓':''}`;
+      const opt = new Option(label, r.id);
+      sel.add(opt);
+    });
+    if (BASELINE_DEFAULT){
+      sel.value = BASELINE_DEFAULT;
+      sel.dispatchEvent(new Event('change'));
+    }
+  }
+
   (async function init(){
     await populateBaselineOptions();
-    await ensureCurrentCDF();
-    renderCDF();
-    if (BASELINE_DEFAULT){ await loadBaseline(BASELINE_DEFAULT); }
+    renderCDF(); // no baseline yet
     document.getElementById('baselineSelect').addEventListener('change', (e)=> loadBaseline(e.target.value));
   })();
 })();
@@ -552,8 +629,3 @@ Plotly.newPlot('quantplot', [
   </form>
 {% endif %}
 {% endblock %}
-
-
-
-
-
