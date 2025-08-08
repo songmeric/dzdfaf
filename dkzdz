@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
 """
 latency-portal  ◆  nano-latency visualiser
-• Adds: baseline comparison (server-rendered dropdown & auto-select), CDF overlay,
-        concise delta summary, robust stats (p99.9, MADn, IQR, outlier rate).
-• No NumPy dependency.
+
+What's new (engineer-friendly, SaaS-style):
+- Baseline comparison via CDF overlay (time-series overlay removed)
+- Clear delta chips with metric labels (Δ P50, Δ P95, Δ P99, Δ P99.9, Δ Outliers)
+- Plain-English interpretation guide with thresholds (configurable below)
+- "Stability & tail" rollups with simple wording (no stats jargon)
+- Dark mode support via base template
+- No extra dependencies
 """
 
 import base64, io, json, logging, pathlib, sqlite3, statistics, datetime as dt
@@ -31,7 +36,19 @@ log = logging.getLogger("latency-portal")
 app       = FastAPI(title="Latency-Portal")
 templates = Jinja2Templates(directory=str(TPL_DIR))
 
-# ─── DB ───────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+# Interpretation thresholds (edit to fit your org)
+# unit: "pct" = percent change vs baseline; "pp" = percentage points
+INTERPRETATION_RULES = {
+    "p50":  {"warn": 10.0, "fail": 20.0, "unit": "pct", "label": "P50"},
+    "p95":  {"warn": 7.0,  "fail": 15.0, "unit": "pct", "label": "P95"},
+    "p99":  {"warn": 5.0,  "fail": 10.0, "unit": "pct", "label": "P99"},
+    "p999": {"warn": 3.0,  "fail": 6.0,  "unit": "pct", "label": "P99.9"},
+    # outlier_rate is measured as share ∈ [0,1], so deltas are in percentage points
+    "outlier_rate": {"warn": 0.5, "fail": 1.0, "unit": "pp", "label": "Outlier rate"},
+}
+# ──────────────────────────────────────────────────────────────────────────────
+
 def _init_db() -> None:
     with sqlite3.connect(DB_PATH) as c:
         c.execute("""CREATE TABLE IF NOT EXISTS runs(
@@ -209,10 +226,10 @@ def show_run(request: Request, run_id:str):
     # Per-second quantiles (current only)
     sec_iso,p50s,p95s,p99s=_per_second_quantiles(df)
 
-    # Robust stats (current run)
+    # Rollups for current run
     stats = _summary_stats(df["latency_ns"])
 
-    # Current CDF (no numpy)
+    # CDF (no extra deps)
     points = 300
     ps = [(i+1)/(points+1) for i in range(points)]
     qs = df["latency_ns"].quantile(ps).astype(float).tolist()
@@ -232,7 +249,8 @@ def show_run(request: Request, run_id:str):
          "baseline_runs": baseline_runs,
          "stats_json": json.dumps(stats),
          "cdf_p_json": json.dumps(ps),
-         "cdf_q_json": json.dumps(qs)})
+         "cdf_q_json": json.dumps(qs),
+         "rules_json": json.dumps(INTERPRETATION_RULES)})
 
 @app.post("/runs/{run_id}/approve")
 def approve(run_id:str, user:str=Form("anon")):
@@ -266,21 +284,6 @@ def view_logs(lines:int=1000):
     except FileNotFoundError: raise HTTPException(404,"log missing")
 
 # ─── Lightweight JSON for overlays/compare ───────────────────────────────────
-@app.get("/runs/{run_id}/per_second_json")
-def per_second_json(run_id:str):
-    meta = _load_run_meta(run_id)
-    df   = _load_run_df_by_meta(meta)
-    sec_iso,p50s,p95s,p99s=_per_second_quantiles(df)
-    return {"run_id":run_id,"sec":sec_iso,"p50":p50s,"p95":p95s,"p99":p99s}
-
-@app.get("/runs/{run_id}/summary_json")
-def summary_json(run_id:str):
-    meta = _load_run_meta(run_id)
-    df   = _load_run_df_by_meta(meta)
-    s    = _summary_stats(df["latency_ns"])
-    s.update({"run_id":run_id,"created_at":meta["created_at"],"approved":bool(meta["approved"])})
-    return s
-
 @app.get("/runs/{run_id}/cdf_json")
 def cdf_json(run_id:str, points:int=300):
     points = max(50, min(int(points), 2000))
@@ -316,48 +319,184 @@ def compare_runs(run_id:str, baseline_id:str):
 
 
 
+base.html
+
+
+<!DOCTYPE html>
+<html data-bs-theme="light">
+<head>
+  <meta charset="utf-8">
+  <title>{% block title %}Latency Portal{% endblock %}</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <!-- Bootstrap & DataTables -->
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+  <link href="https://cdn.datatables.net/1.13.6/css/dataTables.bootstrap5.min.css" rel="stylesheet">
+  <!-- Plotly -->
+  <script src="https://cdn.plot.ly/plotly-2.32.0.min.js"></script>
+  <!-- jQuery + DataTables -->
+  <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
+  <script src="https://cdn.datatables.net/1.13.6/js/jquery.dataTables.min.js"></script>
+  <script src="https://cdn.datatables.net/1.13.6/js/dataTables.bootstrap5.min.js"></script>
+  <!-- Bootstrap JS -->
+  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+  <style>
+    body { font-feature-settings: "ss01" on, "cv01" on; }
+    .navbar-brand { font-weight: 600; letter-spacing: .2px; }
+    .content-wrap { padding: 1.25rem 0 2rem; }
+  </style>
+  <script>
+    // Theme handling (light/dark) with localStorage, and notify pages to restyle charts
+    (function(){
+      const KEY = 'lp-theme';
+      const html = document.documentElement;
+      function apply(theme){
+        const t = theme === 'dark' ? 'dark' : 'light';
+        html.setAttribute('data-bs-theme', t);
+        localStorage.setItem(KEY, t);
+        document.dispatchEvent(new CustomEvent('theme-changed', {detail:{theme:t}}));
+      }
+      function init(){
+        const saved = localStorage.getItem(KEY);
+        if (saved) apply(saved);
+        else {
+          // Prefer system
+          const prefersDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+          apply(prefersDark ? 'dark' : 'light');
+        }
+        const btn = document.getElementById('themeToggle');
+        if (btn) btn.addEventListener('click', ()=> {
+          apply(html.getAttribute('data-bs-theme') === 'dark' ? 'light' : 'dark');
+        });
+      }
+      document.addEventListener('DOMContentLoaded', init);
+    })();
+    // Enable tooltips site-wide
+    document.addEventListener('DOMContentLoaded', ()=> {
+      [...document.querySelectorAll('[data-bs-toggle="tooltip"]')]
+        .forEach(el=>new bootstrap.Tooltip(el));
+    });
+  </script>
+</head>
+<body>
+  <nav class="navbar navbar-expand-lg bg-body-tertiary border-bottom sticky-top">
+    <div class="container-fluid">
+      <a class="navbar-brand" href="/">Latency Portal</a>
+      <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#topnav">
+        <span class="navbar-toggler-icon"></span>
+      </button>
+      <div id="topnav" class="collapse navbar-collapse">
+        <ul class="navbar-nav me-auto mb-2 mb-lg-0">
+          <li class="nav-item"><a class="nav-link" href="/">All runs</a></li>
+          <li class="nav-item"><a class="nav-link" href="/approved">Approved</a></li>
+          <li class="nav-item"><a class="nav-link" href="/runs/latest">Latest</a></li>
+          <li class="nav-item"><a class="nav-link" href="/logs">Logs</a></li>
+        </ul>
+        <div class="d-flex align-items-center gap-2">
+          <button id="themeToggle" class="btn btn-outline-secondary btn-sm" type="button" title="Toggle theme" data-bs-toggle="tooltip">🌙/☀️</button>
+        </div>
+      </div>
+    </div>
+  </nav>
+
+  <main class="container content-wrap">
+    {% block content %}{% endblock %}
+  </main>
+</body>
+</html>
 
 
 
 
+list.html
+
+{% extends 'base.html' %}{% block title %}Latency Benchmarks{% endblock %}
+{% block content %}
+<div class="d-flex justify-content-between align-items-end mb-3">
+  <div>
+    <h4 class="mb-1">Latency Benchmarks</h4>
+    <div class="text-muted small">Drop CSVs into <code>/apps/sp_hfts/latency_csv/</code>. Each CSV becomes one run.</div>
+  </div>
+</div>
+
+<table id="runs-table" class="table table-sm table-hover align-middle">
+  <thead class="table-light">
+    <tr>
+      <th>Run</th>
+      <th>UTC</th>
+      <th title="50th percentile">P50 (ns)</th>
+      <th title="95th percentile">P95 (ns)</th>
+      <th title="99th percentile">P99 (ns)</th>
+      <th title="Population standard deviation">σ (ns)</th>
+      <th title="Total samples">n</th>
+      <th>Status</th>
+    </tr>
+  </thead>
+  <tbody>
+  {% for r in runs %}
+    <tr>
+      <td><a href="/runs/{{ r.id }}" class="text-decoration-none">{{ r.id }}</a></td>
+      <td class="text-nowrap">{{ r.created_at[:19] }}</td>
+      <td>{{ '%.0f'|format(r.p50) }}</td>
+      <td>{{ '%.0f'|format(r.p95) }}</td>
+      <td>{{ '%.0f'|format(r.p99) }}</td>
+      <td>{{ '%.0f'|format(r.stdev) }}</td>
+      <td>{{ r.count }}</td>
+      <td>
+        {% if r.approved %}
+          <span class="badge text-bg-success">APPROVED</span>
+        {% else %}
+          <span class="badge text-bg-danger">PENDING</span>
+        {% endif %}
+      </td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+
+<script>
+  $(function(){
+    $('#runs-table').DataTable({
+      order: [[1,'desc']],
+      pageLength: 25,
+      lengthMenu: [10,25,50,100],
+      stateSave: true
+    });
+  });
+</script>
+{% endblock %}
 
 
 
-
-
-
-
+detail.html
 
 {% extends 'base.html' %}{% block title %}Run {{ id }}{% endblock %}
 {% block content %}
 <style>
-  /* SaaS-like polish without external deps */
-  .page-header { display:flex; justify-content:space-between; align-items:start; gap:1rem; }
-  .page-title { margin:0; }
-  .subtext { color:#6c757d; font-size:.9rem; }
-  .pill { display:inline-flex; align-items:center; gap:.35rem; padding:.25rem .5rem; border-radius:999px; background:#f8f9fa; border:1px solid #e9ecef; font-size:.85rem; }
-  .pill .label { color:#6c757d; }
+  .pill { display:inline-flex; align-items:center; gap:.35rem; padding:.25rem .5rem; border-radius:999px; background:var(--bs-tertiary-bg); border:1px solid var(--bs-border-color); font-size:.85rem; }
+  .pill .label { color:var(--bs-secondary-color); }
   .pill .value { font-weight:600; }
   .metric-row { display:flex; flex-wrap:wrap; gap:.5rem .75rem; }
-  .card-clean { border:1px solid #e9ecef; border-radius:.5rem; }
-  .card-clean .card-header { background:#fff; border-bottom:1px solid #e9ecef; }
-  .delta-chip { padding:.25rem .5rem; border-radius:.5rem; font-weight:600; }
-  .delta-up { color:#842029; background:#f8d7da; }     /* regression (higher is worse) */
-  .delta-down { color:#0f5132; background:#d1e7dd; }   /* improvement (lower is better) */
-  .muted { color:#6c757d; }
-  .tab-pane { padding-top:1rem; }
+
+  .delta-chip { padding:.25rem .5rem; border-radius:.5rem; font-weight:600; display:inline-flex; gap:.35rem; align-items:center; }
+  .delta-up   { color:#842029; background:#f8d7da; }   /* regression */
+  .delta-down { color:#0f5132; background:#d1e7dd; }   /* improvement */
+  .delta-watch { color:#664d03; background:#fff3cd; }  /* watch */
+  .delta-unknown { color:var(--bs-secondary-color); background:var(--bs-tertiary-bg); }
+
+  .card-clean { border:1px solid var(--bs-border-color); border-radius:.5rem; }
+  .card-clean .card-header { background:transparent; border-bottom:1px solid var(--bs-border-color); }
 </style>
 
-<div class="page-header mb-3">
+<div class="d-flex justify-content-between align-items-start mb-3">
   <div>
-    <h3 class="page-title">Run {{ id }}</h3>
-    <div class="subtext">{{ created_at[:19] }} UTC
+    <h4 class="mb-1">Run {{ id }}</h4>
+    <div class="text-muted small">{{ created_at[:19] }} UTC
       {% if approved %}· <span class="text-success">APPROVED</span>
       {% else %}· <span class="text-danger">PENDING</span>{% endif %}
     </div>
-    <!-- Quick key metrics (original set, concise) -->
+    <!-- Key metrics (original set) -->
     <div class="metric-row mt-2">
-      <span class="pill" data-bs-toggle="tooltip" title="50 % of latencies are below this value (median)">
+      <span class="pill" data-bs-toggle="tooltip" title="50% of latencies are below this value (median)">
         <span class="label">P50</span><span class="value">{{ '%.0f'|format(p50) }} ns</span>
       </span>
       <span class="pill" data-bs-toggle="tooltip" title="95th percentile latency">
@@ -366,7 +505,7 @@ def compare_runs(run_id:str, baseline_id:str):
       <span class="pill" data-bs-toggle="tooltip" title="99th percentile latency">
         <span class="label">P99</span><span class="value">{{ '%.0f'|format(p99) }} ns</span>
       </span>
-      <span class="pill" data-bs-toggle="tooltip" title="Population standard deviation">
+      <span class="pill" data-bs-toggle="tooltip" title="Population standard deviation (jitter)">
         <span class="label">σ</span><span class="value">{{ '%.0f'|format(stdev) }} ns</span>
       </span>
       <span class="pill" data-bs-toggle="tooltip" title="Total samples">
@@ -390,17 +529,17 @@ def compare_runs(run_id:str, baseline_id:str):
   </div>
 </div>
 
-<!-- Comparison summary (compact) -->
+<!-- Compact, labeled delta summary -->
 <div id="delta-summary" class="row g-2 mb-3" style="display:none;">
-  <div class="col-auto"><span class="muted">Δ vs baseline:</span></div>
-  <div class="col-auto"><span id="d-p50"  class="delta-chip"></span></div>
-  <div class="col-auto"><span id="d-p95"  class="delta-chip"></span></div>
-  <div class="col-auto"><span id="d-p99"  class="delta-chip"></span></div>
-  <div class="col-auto"><span id="d-p999" class="delta-chip"></span></div>
-  <div class="col-auto"><span id="d-or"   class="delta-chip"></span></div>
+  <div class="col-12 col-md-auto"><span class="text-muted">Δ vs baseline:</span></div>
+  <div class="col-auto"><span class="delta-chip" id="d-p50">Δ P50</span></div>
+  <div class="col-auto"><span class="delta-chip" id="d-p95">Δ P95</span></div>
+  <div class="col-auto"><span class="delta-chip" id="d-p99">Δ P99</span></div>
+  <div class="col-auto"><span class="delta-chip" id="d-p999">Δ P99.9</span></div>
+  <div class="col-auto"><span class="delta-chip" id="d-or">Δ Outliers</span></div>
 </div>
 
-<!-- Tabs: Distribution first (most meaningful), then Quantiles & Raw -->
+<!-- Tabs -->
 <ul class="nav nav-tabs" id="viewTabs" role="tablist">
   <li class="nav-item" role="presentation">
     <button class="nav-link active" id="tab-cdf" data-bs-toggle="tab" data-bs-target="#pane-cdf" type="button" role="tab">Distribution (CDF)</button>
@@ -423,7 +562,7 @@ def compare_runs(run_id:str, baseline_id:str):
   </div>
   <div class="tab-pane fade" id="pane-quant" role="tabpanel" aria-labelledby="tab-quant">
     <div id="quantplot" style="height:360px;"></div>
-    <div class="form-text">Current run only (no overlay) — use CDF for baseline comparison.</div>
+    <div class="form-text">Current run only — use CDF for baseline comparison.</div>
   </div>
   <div class="tab-pane fade" id="pane-raw" role="tabpanel" aria-labelledby="tab-raw">
     <div id="rawplot" style="height:360px;"></div>
@@ -431,24 +570,50 @@ def compare_runs(run_id:str, baseline_id:str):
   </div>
 </div>
 
-<!-- Robust stats with succinct explanations -->
+<!-- Stability & tail indicators (plain-English) -->
 <div class="card card-clean mt-4">
-  <div class="card-header"><strong>Current run — robust stats</strong></div>
+  <div class="card-header"><strong>Stability & tail indicators</strong></div>
   <div class="card-body">
     <div class="row row-cols-2 row-cols-md-3 row-cols-lg-4 g-3" id="current-stats"></div>
     <details class="mt-2">
-      <summary class="small text-muted">What do these mean?</summary>
+      <summary class="small text-muted">How to read these</summary>
       <ul class="small mb-0">
-        <li><b>P99.9</b>: 99.9th percentile (ultra-tail).</li>
-        <li><b>MAD<span style="font-size:0.8em;vertical-align:super;">n</span></b>: robust σ ≈ 1.4826×MAD (less sensitive to outliers).</li>
-        <li><b>IQR</b>: 75th–25th percentile spread (bulk dispersion).</li>
-        <li><b>Outlier rate</b>: share of samples with robust z-score &gt; 3.5 (Hampel proxy).</li>
+        <li><b>Ultra tail (P99.9)</b>: extreme latency; improvements here protect worst‑case behaviour.</li>
+        <li><b>Jitter (robust)</b>: variability insensitive to outliers (MAD-based). Lower = steadier.</li>
+        <li><b>Spread (IQR)</b>: middle 50% band width. Lower = tighter bulk.</li>
+        <li><b>Outliers (%)</b>: share of samples flagged by a robust rule; lower is better.</li>
       </ul>
     </details>
   </div>
 </div>
 
-<!-- Approval actions (unchanged logic, just placed at end) -->
+<!-- Interpretation guide -->
+<div class="card card-clean mt-4">
+  <div class="card-header"><strong>Interpretation guide (default thresholds)</strong></div>
+  <div class="card-body">
+    <div class="row row-cols-1 row-cols-lg-2 g-3">
+      <div>
+        <table class="table table-sm">
+          <thead class="table-light">
+            <tr><th>Metric</th><th>Warn if</th><th>Fail if</th></tr>
+          </thead>
+          <tbody id="guide-table"></tbody>
+        </table>
+      </div>
+      <div class="small text-muted">
+        <p class="mb-2">Use the CDF overlay to verify distribution shifts. Tail metrics (P99/P99.9) matter more than P50 in production risk.</p>
+        <ul class="mb-0">
+          <li><b>P50</b>: UX/snappiness. OK to trade small regressions for big tail wins.</li>
+          <li><b>P95/P99</b>: latency under load. Keep regressions here limited.</li>
+          <li><b>P99.9</b>: worst‑case protection. Prioritize improvements here.</li>
+          <li><b>Outliers</b>: noisy tails; rising rate signals instability or intermittent issues.</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Approval actions -->
 {% if approved %}
   <div class="alert alert-success mt-4 d-flex justify-content-between align-items-center">
     <span>Approved by <b>{{ approved_by }}</b> at {{ approved_at[:19] }} UTC</span>
@@ -466,19 +631,43 @@ def compare_runs(run_id:str, baseline_id:str):
 {% endif %}
 
 <script>
-  // -------- Helpers
+  // ---------- Utils
+  const RULES = {{ rules_json|safe }};
   const fmtInt = (v)=> (v===null||v===undefined) ? '–' : Math.round(v).toLocaleString('en');
   const fmtNs  = (v)=> (v===null||v===undefined) ? '–' : Math.round(v).toLocaleString('en') + ' ns';
   const fmtPct = (v)=> (v===null||v===undefined) ? '–' : v.toFixed(2) + ' %';
 
-  // -------- Current-run robust stats
+  function makeLayout(title, xTitle, yTitle){
+    const cs = getComputedStyle(document.body);
+    const color = cs.color || '#212529';
+    return {
+      title, paper_bgcolor:'rgba(0,0,0,0)', plot_bgcolor:'rgba(0,0,0,0)',
+      font:{color},
+      margin:{l:40,r:20,t:40,b:40},
+      xaxis:{title:xTitle, type:'date'},
+      yaxis:{title:yTitle}
+    };
+  }
+  function makeLayoutXY(title, xTitle, yTitle){
+    const cs = getComputedStyle(document.body);
+    const color = cs.color || '#212529';
+    return {
+      title, paper_bgcolor:'rgba(0,0,0,0)', plot_bgcolor:'rgba(0,0,0,0)',
+      font:{color},
+      margin:{l:40,r:20,t:40,b:40},
+      xaxis:{title:xTitle},
+      yaxis:{title:yTitle}
+    };
+  }
+
+  // ---------- Current-run indicators (plain names)
   (function renderCurrentStats(){
     const s = {{ stats_json|safe }};
     const items = [
-      {k:'p999',lbl:'P99.9',fmt:fmtNs, tip:'99.9th percentile'},
-      {k:'madn',lbl:'MAD\u2099',fmt:fmtNs, tip:'Robust σ ≈ 1.4826×MAD'},
-      {k:'iqr', lbl:'IQR',  fmt:fmtNs, tip:'75th–25th percentile'},
-      {k:'outlier_rate',lbl:'Outlier rate',fmt:(v)=>fmtPct(v*100), tip:'Robust z > 3.5'},
+      {k:'p999',lbl:'Ultra tail (P99.9)',fmt:fmtNs, tip:'Extreme latency (99.9th)'},
+      {k:'madn',lbl:'Jitter (robust)',  fmt:fmtNs, tip:'MAD-based variability'},
+      {k:'iqr', lbl:'Spread (IQR)',     fmt:fmtNs, tip:'Middle 50% width'},
+      {k:'outlier_rate',lbl:'Outliers (%)',fmt:(v)=>fmtPct(v*100), tip:'Robust outlier share'},
       {k:'mean',lbl:'Mean',fmt:fmtNs, tip:'Arithmetic mean'},
       {k:'stdev',lbl:'σ',fmt:fmtNs, tip:'Population standard deviation'},
       {k:'min',lbl:'Min',fmt:fmtNs, tip:'Minimum latency'},
@@ -496,11 +685,28 @@ def compare_runs(run_id:str, baseline_id:str):
       box.appendChild(div);
     });
     if (window.bootstrap){
-      [...document.querySelectorAll('[data-bs-toggle="tooltip"]')].forEach(el=>new bootstrap.Tooltip(el));
+      [...document.querySelectorAll('[data-bs-toggle="tooltip"]')]
+        .forEach(el=>new bootstrap.Tooltip(el));
     }
   })();
 
-  // -------- CDF (current + optional baseline overlay)
+  // ---------- Interpretation guide table
+  (function renderGuide(){
+    const tbody = document.getElementById('guide-table');
+    const rows = [
+      ['p50',  'P50'], ['p95','P95'], ['p99','P99'], ['p999','P99.9'], ['outlier_rate','Outlier rate']
+    ];
+    rows.forEach(([k,label])=>{
+      const r = RULES[k];
+      const warn = r.unit==='pp' ? `${r.warn} pp` : `${r.warn}%`;
+      const fail = r.unit==='pp' ? `${r.fail} pp` : `${r.fail}%`;
+      const tr = document.createElement('tr');
+      tr.innerHTML = `<td>${label}</td><td>+${warn}</td><td>+${fail}</td>`;
+      tbody.appendChild(tr);
+    });
+  })();
+
+  // ---------- CDF (current + optional baseline overlay)
   const CURRENT_CDF = { p: {{ cdf_p_json|safe }}, q_ns: {{ cdf_q_json|safe }}, run_id: "{{ id }}" };
   let baselineCDF = null;
 
@@ -516,17 +722,18 @@ def compare_runs(run_id:str, baseline_id:str):
         name: `${baselineCDF.run_id} (baseline)`, mode:'lines', line:{dash:'dot'}
       });
     }
-    Plotly.react('cdfplot', data, {
-      title:'Latency distribution (CDF)',
-      margin:{l:40,r:20,t:40,b:40},
-      xaxis:{title:'Latency (ns)'},
-      yaxis:{title:'Cumulative (%)', range:[0,100]}
-    });
+    Plotly.react('cdfplot', data, makeLayoutXY('Latency distribution (CDF)','Latency (ns)','Cumulative (%)'));
   }
 
   document.getElementById('toggleBaselineCDF').addEventListener('change', renderCDF);
+  document.addEventListener('theme-changed', ()=> {
+    // update plot font colors on theme switch
+    Plotly.relayout('cdfplot', makeLayoutXY('Latency distribution (CDF)','Latency (ns)','Cumulative (%)'));
+    if (quantReady) Plotly.relayout('quantplot', makeLayout('Per-second quantiles (current)','Time (1-s buckets)','Latency (ns)'));
+    if (rawReady)   Plotly.relayout('rawplot', makeLayout('Latency per message (current)','Ingress time','Latency (ns)'));
+  });
 
-  // -------- Quantiles & Raw (render on first tab show for proper sizing)
+  // ---------- Quantiles & Raw (render on first tab show for sizing)
   let quantReady=false, rawReady=false;
   document.getElementById('viewTabs').addEventListener('shown.bs.tab', (e)=>{
     const id = e.target.getAttribute('data-bs-target');
@@ -535,34 +742,51 @@ def compare_runs(run_id:str, baseline_id:str):
         {x:{{ sec_json|safe }}, y:{{ p50_json|safe }}, name:'P50', mode:'lines'},
         {x:{{ sec_json|safe }}, y:{{ p95_json|safe }}, name:'P95', mode:'lines'},
         {x:{{ sec_json|safe }}, y:{{ p99_json|safe }}, name:'P99', mode:'lines'}
-      ], {
-        title:'Per-second quantiles (current)',
-        margin:{l:40,r:20,t:40,b:40},
-        xaxis:{title:'Time (1-s buckets)', type:'date'},
-        yaxis:{title:'Latency (ns)'}
-      });
+      ], makeLayout('Per-second quantiles (current)','Time (1-s buckets)','Latency (ns)'));
       quantReady=true;
     }
     if (id === '#pane-raw' && !rawReady){
-      Plotly.newPlot('rawplot', [{x:{{ x_json|safe }}, y:{{ y_json|safe }}, mode:'lines', line:{width:1}}], {
-        title:'Latency per message (current)',
-        margin:{l:40,r:20,t:40,b:40},
-        xaxis:{title:'Ingress time', type:'date'},
-        yaxis:{title:'Latency (ns)'}
-      });
+      Plotly.newPlot('rawplot', [{x:{{ x_json|safe }}, y:{{ y_json|safe }}, mode:'lines', line:{width:1}}],
+        makeLayout('Latency per message (current)','Ingress time','Latency (ns)'));
       rawReady=true;
     }
   });
 
-  // -------- Baseline selection: overlay CDF + compact delta chips + (optional) table
-  function paintDelta(el, valueAbs, valuePct, lowerIsBetter=true, unit='ns'){
-    if (valueAbs==null || isNaN(valueAbs)) { el.style.display='none'; return; }
-    const regresses = lowerIsBetter ? (valueAbs>0) : (valueAbs<0);
-    el.className = 'delta-chip ' + (regresses ? 'delta-up' : 'delta-down');
-    const arrow = regresses ? '↑' : '↓';
-    const pctTxt = (valuePct==null || isNaN(valuePct)) ? '' : ` (${valuePct.toFixed(2)}%)`;
-    el.textContent = `${arrow} ${Math.round(valueAbs)} ${unit}${pctTxt}`;
-    el.style.display='';
+  // ---------- Baseline selection: overlay CDF + labeled delta chips
+  function chip(el, text, cls){ el.textContent = text; el.className = `delta-chip ${cls}`; }
+
+  function severityFor(metricKey, delta){
+    const r = RULES[metricKey]; if (!r) return {level:'unknown', value:null};
+    if (metricKey === 'outlier_rate'){
+      // use absolute delta in percentage points
+      const val = Math.abs((delta && delta.abs!=null) ? delta.abs*100 : NaN);
+      if (isNaN(val)) return {level:'unknown', value:null};
+      if (val >= r.fail) return {level:'fail', value:val};
+      if (val >= r.warn) return {level:'watch', value:val};
+      return {level:'ok', value:val};
+    } else {
+      const val = Math.abs((delta && delta.pct!=null) ? delta.pct : NaN);
+      if (isNaN(val)) return {level:'unknown', value:null};
+      if (val >= r.fail) return {level:'fail', value:val};
+      if (val >= r.warn) return {level:'watch', value:val};
+      return {level:'ok', value:val};
+    }
+  }
+
+  function paintDelta(elId, metricKey, delta, unitLabel){
+    const el = document.getElementById(elId);
+    if (!delta){ chip(el, `${RULES[metricKey].label}: n/a`, 'delta-unknown'); return; }
+    const lowerIsBetter = new Set(['p50','p95','p99','p999','outlier_rate']);
+    const regression = lowerIsBetter.has(metricKey) ? (delta.abs>0) : (delta.abs<0);
+    // Build text: Δ X: +123 ns (+4.2%) [OK/Watch/Fail]
+    const pctText = (delta.pct==null || isNaN(delta.pct)) ? '' : ` (${delta.pct.toFixed(2)}%)`;
+    const absVal = metricKey==='outlier_rate' ? (delta.abs*100).toFixed(2) + ' pp' : Math.round(delta.abs) + ' ns';
+    const sev = severityFor(metricKey, delta);
+    // Improvements are always OK
+    const level = regression ? sev.level : 'ok';
+    const clsMap = {ok:'delta-down', watch:'delta-watch', fail:'delta-up', unknown:'delta-unknown'};
+    const statusLabel = {ok:'OK', watch:'WATCH', fail:'FAIL', unknown:'N/A'}[level];
+    chip(el, `Δ ${RULES[metricKey].label}: ${absVal}${pctText} • ${statusLabel}`, clsMap[level]);
   }
 
   async function updateComparison(baselineId){
@@ -571,23 +795,17 @@ def compare_runs(run_id:str, baseline_id:str):
       baselineCDF = null; renderCDF(); summary.style.display='none';
       return;
     }
-    // fetch CDF for overlay
     baselineCDF = await (await fetch(`/runs/${baselineId}/cdf_json?points=300`)).json();
     renderCDF();
 
-    // fetch deltas
     const cmp = await (await fetch(`/runs/{{ id }}/compare?baseline_id=${baselineId}`)).json();
     summary.style.display='flex';
 
-    // p50/p95/p99/p999 deltas (lower is better)
-    paintDelta(document.getElementById('d-p50'),  cmp.delta.p50.abs,  cmp.delta.p50.pct,  true, 'ns');
-    paintDelta(document.getElementById('d-p95'),  cmp.delta.p95.abs,  cmp.delta.p95.pct,  true, 'ns');
-    paintDelta(document.getElementById('d-p99'),  cmp.delta.p99.abs,  cmp.delta.p99.pct,  true, 'ns');
-    paintDelta(document.getElementById('d-p999'), cmp.delta.p999.abs, cmp.delta.p999.pct, true, 'ns');
-    // outlier rate (lower is better) – show as percentage
-    const orAbsPct = (cmp.delta.outlier_rate.abs ?? 0) * 100;
-    const orPctPct = (cmp.delta.outlier_rate.pct==null) ? null : cmp.delta.outlier_rate.pct;
-    paintDelta(document.getElementById('d-or'), orAbsPct, orPctPct, true, '%');
+    paintDelta('d-p50',  'p50',  cmp.delta.p50,  'ns');
+    paintDelta('d-p95',  'p95',  cmp.delta.p95,  'ns');
+    paintDelta('d-p99',  'p99',  cmp.delta.p99,  'ns');
+    paintDelta('d-p999', 'p999', cmp.delta.p999, 'ns');
+    paintDelta('d-or',   'outlier_rate', cmp.delta.outlier_rate, '%');
   }
 
   const sel = document.getElementById('baselineSelect');
@@ -596,13 +814,11 @@ def compare_runs(run_id:str, baseline_id:str):
   // Auto-load default baseline if present
   {% if baseline_default %}
     updateComparison("{{ baseline_default }}");
+  {% else %}
+    renderCDF();
   {% endif %}
-
-  // Initialize CDF immediately (without baseline)
-  renderCDF();
 </script>
 {% endblock %}
-
 
 
 
