@@ -1,0 +1,160 @@
+// MIT License
+// Build (Linux/macOS):
+//   g++ -O2 -std=c++17 ipopt_ts_pcpp.cpp \
+//       -lPcap++ -lPacket++ -lCommon++ -lpcap -o ipopt_ts_pcpp
+// Usage:
+//   ./ipopt_ts_pcpp in.pcap out.pcap
+//
+// Assumptions:
+// - Packets are Ethernet -> IPv4 -> UDP.
+// - The UDP payload begins with an 8-byte binary timestamp (whatever endian you use;
+//   we just copy raw bytes). Adjust OFFSET or SIZE below if needed.
+//
+// What it does:
+// - For packet i it writes 16 bytes into IPv4 options: [ts_this(8) | ts_next(8)].
+// - Uses IPv4 option type "Dynamic Packet State" (enum exists in pcpp) as a generic TLV
+//   container for our 16-byte blob.
+// - Pads with NOP to 4-byte boundary, recomputes header fields, and writes out.
+
+#include <cstdio>
+#include <cstdint>
+#include <cstring>
+#include <vector>
+#include <string>
+
+#include "PcapFileDevice.h"
+#include "Packet.h"
+#include "IPv4Layer.h"
+#include "UdpLayer.h"
+
+static constexpr size_t TS_OFFSET = 0;   // bytes into UDP payload
+static constexpr size_t TS_SIZE   = 8;   // bytes per timestamp (payload format)
+
+// Grab first 8 bytes of UDP payload (+offset). Returns false if not UDP or too short.
+static bool extract_ts8(pcpp::Packet& pkt, uint8_t out[TS_SIZE]) {
+    auto* udp = pkt.getLayerOfType<pcpp::UdpLayer>();
+    if (!udp) return false;
+    const uint8_t* pay = udp->getLayerPayload();
+    size_t len = udp->getLayerPayloadSize();
+    if (!pay || len < TS_OFFSET + TS_SIZE) return false;
+    std::memcpy(out, pay + TS_OFFSET, TS_SIZE);
+    return true;
+}
+
+// Add a 16-byte TLV IPv4 option holding [ts_this|ts_next], padding the header to 4B boundary.
+// If options would overflow (max 40 bytes), tries to wipe existing options first.
+static bool add_two_ts_to_ipopts(pcpp::Packet& pkt, const uint8_t ts_this[8], const uint8_t ts_next[8]) {
+    auto* ip = pkt.getLayerOfType<pcpp::IPv4Layer>();
+    if (!ip) return false;
+
+    // Ensure room: 20 base + up to 40 options = 60 total
+    size_t curHdr = ip->getHeaderLen();           // includes existing options
+    const size_t addLen = 2 + 16;                 // TLV: 1 type + 1 len + 16 data
+    if (curHdr + addLen > 60) {
+        // nuke existing options and try again
+        ip->removeAllOptions();
+        curHdr = ip->getHeaderLen();
+        if (curHdr + addLen > 60) return false;   // still impossible
+    }
+
+    // Build 16-byte value = ts_this || ts_next
+    uint8_t val[16];
+    std::memcpy(val, ts_this, 8);
+    std::memcpy(val + 8, ts_next, 8);
+
+    // Use a generic variable-length option enum from pcpp as a container.
+    // IPV4OPT_DynamicPacketState exists in pcpp::IPv4OptionTypes.
+    pcpp::IPv4OptionBuilder optBuilder(pcpp::IPV4OPT_DynamicPacketState, val, (uint8_t)sizeof(val));
+    auto opt = ip->addOption(optBuilder);
+    if (opt.isNull()) return false;
+
+    // Pad total IPv4 header to 4-byte boundary with NOPs (type=1, 1 byte each).
+    size_t afterHdr = ip->getHeaderLen();
+    size_t pad = (4 - (afterHdr % 4)) % 4;
+    for (size_t i = 0; i < pad; ++i) {
+        pcpp::IPv4OptionBuilder nopBuilder(pcpp::IPV4OPT_NOP, nullptr, 0);
+        if (ip->addOption(nopBuilder).isNull()) return false;
+    }
+
+    return true;
+}
+
+static void compute_all(pcpp::Packet& pkt) {
+    // Fix IPv4 total length + checksum, and keep UDP checksum correct.
+    // Packet::computeCalculateFields walks all layers. (pcpp docs)
+    pkt.computeCalculateFields();
+}
+
+int main(int argc, char** argv) {
+    if (argc < 3) {
+        std::fprintf(stderr, "Usage: %s in.pcap out.pcap\n", argv[0]);
+        return 2;
+    }
+    const char* inPath  = argv[1];
+    const char* outPath = argv[2];
+
+    // Reader: libpcap (pcap, not pcapng) as requested
+    pcpp::PcapFileReaderDevice reader(inPath);
+    if (!reader.open()) {
+        std::fprintf(stderr, "error: cannot open input pcap '%s'\n", inPath);
+        return 1;
+    }
+
+    // Writer: same link-layer as input
+    pcpp::LinkLayerType llt = reader.getLinkLayerType();
+    pcpp::PcapFileWriterDevice writer(outPath, llt);
+    if (!writer.open()) {
+        std::fprintf(stderr, "error: cannot open output pcap '%s'\n", outPath);
+        reader.close();
+        return 1;
+    }
+
+    // Prime a 2-packet window
+    pcpp::RawPacket curRaw, nextRaw;
+    bool haveCur = reader.getNextPacket(curRaw);
+    if (!haveCur) { reader.close(); writer.close(); return 0; }
+    bool haveNext = reader.getNextPacket(nextRaw);
+
+    // If only one packet exists, we’ll duplicate its ts as next.
+    while (haveCur) {
+        pcpp::Packet curPkt(&curRaw);
+        uint8_t ts_this[TS_SIZE] = {0};
+        bool ok_this = extract_ts8(curPkt, ts_this);
+
+        uint8_t ts_next[TS_SIZE] = {0};
+        bool ok_next = false;
+
+        if (haveNext) {
+            pcpp::Packet nextPkt(&nextRaw);
+            ok_next = extract_ts8(nextPkt, ts_next);
+        } else {
+            // last packet: use its own ts as "next"
+            std::memcpy(ts_next, ts_this, TS_SIZE);
+            ok_next = ok_this;
+        }
+
+        if (ok_this && ok_next) {
+            // Insert into IPv4 options of current packet
+            if (add_two_ts_to_ipopts(curPkt, ts_this, ts_next)) {
+                compute_all(curPkt);
+            } else {
+                std::fprintf(stderr, "warn: could not add options (space?) — packet left unchanged\n");
+            }
+        } else {
+            // not UDP or payload too short; leave unchanged
+        }
+
+        // Write current (possibly edited)
+        writer.writePacket(*curPkt.getRawPacket());
+
+        // Slide window
+        if (!haveNext) break;
+        curRaw = nextRaw;
+        haveCur = true;
+        haveNext = reader.getNextPacket(nextRaw);
+    }
+
+    reader.close();
+    writer.close();
+    return 0;
+}
