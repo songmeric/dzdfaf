@@ -1,0 +1,190 @@
+// MIT License
+// geohot-style: single file, zero deps, mmap for speed, brutal pointer math.
+// Build: g++ -O2 -std=c++17 pcap_next_ts.cpp -o pcap_next_ts
+// Usage: ./pcap_next_ts input.pcap
+//
+// Focus: the pointer arithmetic to retrieve *packet i+1*'s UDP payload timestamp.
+
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <cstdlib>
+
+#pragma pack(push, 1)
+struct pcap_hdr_t {
+  uint32_t magic_number;   // 0xa1b2c3d4 or 0xd4c3b2a1, 0xa1b23c4d(nsec)
+  uint16_t version_major;  // 2
+  uint16_t version_minor;  // 4
+  int32_t  thiszone;
+  uint32_t sigfigs;
+  uint32_t snaplen;
+  uint32_t network;        // 1 == DLT_EN10MB (Ethernet)
+};
+
+struct pcaprec_hdr_t {
+  uint32_t ts_sec;
+  uint32_t ts_usec;  // or nsec depending on magic
+  uint32_t incl_len;
+  uint32_t orig_len;
+};
+
+struct ether_hdr_t {
+  uint8_t  dst[6];
+  uint8_t  src[6];
+  uint16_t ethertype; // big-endian
+};
+
+struct vlan_hdr_t {
+  uint16_t tci;       // tag control info
+  uint16_t ethertype; // big-endian inner
+};
+
+struct ipv4_hdr_t {
+  uint8_t  ver_ihl;     // version<<4 | ihl
+  uint8_t  tos;
+  uint16_t tot_len;     // big-endian
+  uint16_t id;
+  uint16_t frag_off;    // flags+frag off
+  uint8_t  ttl;
+  uint8_t  protocol;    // 17 = UDP
+  uint16_t check;
+  uint32_t saddr;
+  uint32_t daddr;
+  // options may follow...
+};
+
+struct udp_hdr_t {
+  uint16_t sport;
+  uint16_t dport;
+  uint16_t len;
+  uint16_t check;
+};
+#pragma pack(pop)
+
+static inline uint16_t be16(const void* p) {
+  const uint8_t* b = (const uint8_t*)p;
+  return (uint16_t(b[0])<<8) | uint16_t(b[1]);
+}
+
+static inline uint16_t be16v(uint16_t v) {
+  return (uint16_t)((v>>8) | (v<<8));
+}
+
+// Return pointer to UDP payload start for the packet whose record header
+// is at file offset `rec_off`. Returns nullptr if anything looks off.
+const uint8_t* udp_payload_ptr(const uint8_t* base, const uint8_t* end, size_t rec_off) {
+  if (base + rec_off + sizeof(pcaprec_hdr_t) > end) return nullptr;
+
+  auto* rh = (const pcaprec_hdr_t*)(base + rec_off);
+  const uint8_t* pkt = base + rec_off + sizeof(pcaprec_hdr_t);
+  const uint8_t* pkt_end = pkt + rh->incl_len;
+  if (pkt_end > end) return nullptr;
+
+  // Ethernet
+  if (pkt + sizeof(ether_hdr_t) > pkt_end) return nullptr;
+  const auto* eth = (const ether_hdr_t*)pkt;
+  size_t l2_off = sizeof(ether_hdr_t);
+  uint16_t et = (uint16_t)be16(&eth->ethertype);
+
+  // Single VLAN (optional)
+  if (et == 0x8100 || et == 0x88A8) {
+    if (pkt + l2_off + sizeof(vlan_hdr_t) > pkt_end) return nullptr;
+    const auto* vlan = (const vlan_hdr_t*)(pkt + l2_off);
+    et = (uint16_t)be16(&vlan->ethertype);
+    l2_off += sizeof(vlan_hdr_t);
+  }
+
+  if (et != 0x0800) return nullptr; // not IPv4
+
+  // IPv4
+  if (pkt + l2_off + sizeof(ipv4_hdr_t) > pkt_end) return nullptr;
+  const auto* ip = (const ipv4_hdr_t*)(pkt + l2_off);
+  uint8_t version = ip->ver_ihl >> 4;
+  uint8_t ihl = (ip->ver_ihl & 0x0F) * 4;
+  if (version != 4 || ihl < 20) return nullptr;
+  if (pkt + l2_off + ihl > pkt_end) return nullptr;
+  if (ip->protocol != 17) return nullptr; // not UDP
+
+  // UDP
+  const uint8_t* udp = pkt + l2_off + ihl;
+  if (udp + sizeof(udp_hdr_t) > pkt_end) return nullptr;
+
+  const uint8_t* payload = udp + sizeof(udp_hdr_t);
+  if (payload > pkt_end) return nullptr;
+  return payload; // may be empty if UDP len==8; caller should check length if needed
+}
+
+// Return the file offset of the next record header given current record offset.
+bool next_record_off(const uint8_t* base, const uint8_t* end, size_t cur_rec_off, size_t& out_next_off) {
+  if (base + cur_rec_off + sizeof(pcaprec_hdr_t) > end) return false;
+  auto* rh = (const pcaprec_hdr_t*)(base + cur_rec_off);
+  size_t next = cur_rec_off + sizeof(pcaprec_hdr_t) + rh->incl_len;
+  if (base + next + sizeof(pcaprec_hdr_t) > end) return false;
+  out_next_off = next;
+  return true;
+}
+
+int main(int argc, char** argv) {
+  if (argc < 1+1) {
+    std::fprintf(stderr, "Usage: %s input.pcap\n", argv[0]);
+    return 2;
+  }
+
+  int fd = ::open(argv[1], O_RDONLY);
+  if (fd < 0) { perror("open"); return 1; }
+  struct stat st{};
+  if (fstat(fd, &st) < 0) { perror("fstat"); return 1; }
+  size_t sz = (size_t)st.st_size;
+  if (sz < sizeof(pcap_hdr_t)) { std::fprintf(stderr, "file too small\n"); return 1; }
+
+  uint8_t* map = (uint8_t*)mmap(nullptr, sz, PROT_READ, MAP_PRIVATE, fd, 0);
+  if (map == MAP_FAILED) { perror("mmap"); return 1; }
+  const uint8_t* base = map;
+  const uint8_t* end  = map + sz;
+
+  // Check global header
+  auto* gh = (const pcap_hdr_t*)base;
+  if (!(gh->magic_number == 0xa1b2c3d4 || gh->magic_number == 0xa1b23c4d)) {
+    std::fprintf(stderr, "unsupported pcap magic (endianness/nsec not handled here)\n");
+    return 1;
+  }
+  if (gh->network != 1) {
+    std::fprintf(stderr, "unsupported DLT (need Ethernet/EN10MB=1)\n");
+    return 1;
+  }
+
+  // Walk records and demonstrate retrieving *next packet's* UDP payload timestamp.
+  size_t rec_off = sizeof(pcap_hdr_t);
+  int idx = 0;
+  while (base + rec_off + sizeof(pcaprec_hdr_t) <= end) {
+    const uint8_t* cur_payload = udp_payload_ptr(base, end, rec_off);
+
+    size_t next_off;
+    if (!next_record_off(base, end, rec_off, next_off)) break; // no next packet
+    const uint8_t* next_payload = udp_payload_ptr(base, end, next_off);
+
+    if (cur_payload && next_payload) {
+      // Example: read first 8 bytes of each payload as a uint64 timestamp.
+      uint64_t ts1 = 0, ts2 = 0;
+      std::memcpy(&ts1, cur_payload, sizeof(uint64_t));
+      std::memcpy(&ts2, next_payload, sizeof(uint64_t));
+
+      // This is where you'd write ts1 and ts2 into IP options for *current* packet.
+      // (Not shown here; request was specifically the pointer arithmetic for packet 2.)
+      std::printf("pkt[%d]: ts_this=%llu  ts_next=%llu\n",
+                  idx, (unsigned long long)ts1, (unsigned long long)ts2);
+    }
+
+    // advance to next record
+    if (!next_record_off(base, end, rec_off, rec_off)) break;
+    ++idx;
+  }
+
+  munmap(map, sz);
+  close(fd);
+  return 0;
+}
