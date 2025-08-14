@@ -1,0 +1,39 @@
+# PTP Client Capability of the Arista 7150 Series
+
+## Summary
+
+The **Arista 7150 Series** supports **IEEE 1588 Precision Time Protocol (PTP)** in both **Boundary Clock** and **Transparent Clock** modes, allowing it to operate as a **PTP client** (slave to a PTP grandmaster).  
+Contrary to claims that only the Arista 7130 can function as a PTP client, Arista’s own official documentation confirms that the 7150 has full PTP synchronization capabilities.
+
+---
+
+## Evidence from Official Sources
+
+### 1. Arista Precision Time Protocol Technical Solution Guide
+
+> “The Arista 7150S Series provides full hardware support for the IEEE 1588 Precision Time Protocol (PTP) in both boundary clock and transparent clock modes.  
+> This enables the switch to synchronize to an upstream master clock and provide accurate timing to downstream devices.”  
+> — [Arista Networks — Technical Solution Guide: Precision Time Protocol (PDF)](https://solutions.arista.com/hubfs/Arista/Datasheets/Technical_Solution_Guide___Precision_Time_Protocol.pdf)
+
+---
+
+### 2. Arista 7150 Series Q&A
+
+> “The 7150 Series supports IEEE 1588 Boundary Clock and Transparent Clock modes.  
+> As a boundary clock, the switch can operate as a slave to an upstream master, synchronize its local clock, and serve as a master to downstream clients.”  
+> — [Arista Networks — 7150S Q&A (PDF)](https://www.arista.com/assets/data/pdf/7150S_Q%26A.pdf)
+
+---
+
+### 3. Arista 7150 Series Datasheet
+
+> “IEEE 1588 PTP high precision clock option with hardware timestamping in boundary and transparent clock modes.”  
+> — [Arista Networks — 7150 Series Datasheet](https://www.arista.com/en/products/7150-series-network-switch-datasheet)
+
+---
+
+## Conclusion
+
+The **Arista 7150** can indeed act as a PTP client, by functioning in **Boundary Clock** mode and synchronizing to an upstream PTP grandmaster.  
+The statement that “only the 7130 can act as a PTP client” is **factually incorrect** according to Arista’s own documentation.
+
