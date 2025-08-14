@@ -13,14 +13,13 @@
 // BUILD (Linux/macOS):
 //   g++ -O2 -std=c++17 ipopt_ts_spcast_v3.cpp \
 //       -lPcap++ -lPacket++ -lCommon++ -lpcap -lpthread -o ipopt_ts_spcast_v3
-//   // If needed: -I/usr/local/include/pcapplusplus  -L/usr/local/lib
 //
 // USAGE:
 //   ./ipopt_ts_spcast_v3 in.pcap out.pcap [options]
-//     --same-flow            Only use the next packet if it matches the same 5-tuple
+//     --same-flow            Only use next packet if same 5-tuple
 //     --send-off N           Offset of send_timestamp_ns in UDP payload (default: 9)
 //     --rewrite-mgroup IP    Overwrite IPv4 dst to this (multicast) group for UDP packets
-//     --rewrite-dport N      Overwrite UDP dst port to this value for UDP packets
+//     --rewrite-dport N      Overwrite UDP dst port for UDP packets
 //     --rewrite-l2           Also rewrite Ethernet dst MAC to match the new multicast IP
 //
 #include <cstdint>
@@ -40,15 +39,15 @@ using namespace pcpp;
 
 // Deduce the IPv4 option enum type in a portable way across PcapPlusPlus versions.
 using IPv4OptEnum = decltype(IPV4OPT_NOP);
-// Use an experimental/private-use option number. Decimal 30 (0x1E).
+// Use an experimental/private-use option number (RFC 3692-style). Decimal 30 (0x1E).
 static constexpr IPv4OptEnum kOurIpv4OptType = static_cast<IPv4OptEnum>(30);
 
 // ---------------- Configuration ----------------
-static IPv4Address g_newDstGroup;            // multicast group to overwrite to
+static IPv4Address g_newDstGroup;             // multicast group to overwrite to
 static bool        g_haveNewDstGroup = false;
-static uint16_t    g_newDstPort      = 0;    // 0 = no change
+static uint16_t    g_newDstPort      = 0;     // 0 = no change
 static bool        g_rewriteL2       = false; // also rewrite Ethernet dest MAC
-static size_t      g_spcast_send_off = 9;    // Spcast V3 send_timestamp_ns offset ([ver:1][recv:8][send:8])
+static size_t      g_spcast_send_off = 9;     // Spcast V3 send_timestamp_ns offset (ver:1, recv:8, send:8)
 static bool        g_requireSameFlow = false;
 
 // ---------------- Spcast V3 extraction ----------------
@@ -70,13 +69,13 @@ static bool extract_spcast_send_ts8(Packet& pkt, uint8_t out[8]) {
 // ---------------- Helpers ----------------
 static bool isMulticastIPv4(const IPv4Address& ip) {
     // 224.0.0.0/4
-    uint32_t be = htonl(ip.toInt());
+    uint32_t be = htonl(ip.toInt());             // to bytes in network order
     uint8_t first = static_cast<uint8_t>(be >> 24);
     return first >= 224 && first <= 239;
 }
 
 static MacAddress multicastMacFromIPv4(const IPv4Address& ip) {
-    // RFC 1112: 01:00:5e:0xxxxxxx:xxxx:xxxx (lower 23 bits of IP)
+    // RFC 1112 mapping: 01:00:5e:0xxxxxxx:xxxx:xxxx (lower 23 bits of IP)
     uint32_t be = htonl(ip.toInt());
     uint8_t b2 = static_cast<uint8_t>(be >> 16);
     uint8_t b3 = static_cast<uint8_t>(be >> 8);
@@ -113,7 +112,6 @@ static bool add_next_ts_to_ipopts(Packet& pkt, const uint8_t ts_next[8]) {
         if (curHdr + addLen + pad > 60) return false;
     }
 
-    // Builder expects a non-const pointer; copy to a local buffer
     uint8_t val[8]; std::memcpy(val, ts_next, 8);
     IPv4OptionBuilder optBuilder(kOurIpv4OptType, val, static_cast<uint8_t>(sizeof(val)));
     if (ip->addOption(optBuilder).isNull()) return false;
@@ -129,21 +127,23 @@ static bool add_next_ts_to_ipopts(Packet& pkt, const uint8_t ts_next[8]) {
 static bool apply_rewrites(Packet& pkt) {
     bool modified = false;
 
-    IPv4Layer* ip = pkt.getLayerOfType<IPv4Layer>();
-    if (ip && g_haveNewDstGroup) {
-        ip->setDstIPv4Address(g_newDstGroup);
-        modified = true;
+    if (IPv4Layer* ip = pkt.getLayerOfType<IPv4Layer>()) {
+        if (g_haveNewDstGroup) {
+            ip->setDstIPv4Address(g_newDstGroup);
+            modified = true;
+        }
     }
 
-    UdpLayer* udp = pkt.getLayerOfType<UdpLayer>();
-    if (udp && g_newDstPort != 0) {
-        udp->setDstPort(g_newDstPort);
-        modified = true;
+    if (UdpLayer* udp = pkt.getLayerOfType<UdpLayer>()) {
+        if (g_newDstPort != 0) {
+            // Older PcapPlusPlus may not have setDstPort(); write header directly.
+            udp->getUdpHeader()->portDst = htons(g_newDstPort);
+            modified = true;
+        }
     }
 
     if (g_rewriteL2 && g_haveNewDstGroup && isMulticastIPv4(g_newDstGroup)) {
-        EthLayer* eth = pkt.getLayerOfType<EthLayer>();
-        if (eth) {
+        if (EthLayer* eth = pkt.getLayerOfType<EthLayer>()) {
             eth->setDestMac(multicastMacFromIPv4(g_newDstGroup));
             modified = true;
         }
@@ -169,92 +169,4 @@ int main(int argc, char** argv) {
     for (int i = 3; i < argc; ++i) {
         if (std::strcmp(argv[i], "--same-flow") == 0) {
             g_requireSameFlow = true;
-        } else if (std::strcmp(argv[i], "--send-off") == 0 && i + 1 < argc) {
-            g_spcast_send_off = static_cast<size_t>(std::strtoul(argv[++i], nullptr, 0));
-        } else if (std::strcmp(argv[i], "--rewrite-mgroup") == 0 && i + 1 < argc) {
-            IPv4Address temp(argv[++i]);
-            if (!temp.isValid()) { std::fprintf(stderr, "error: invalid IPv4 for --rewrite-mgroup\n"); return 2; }
-            if (!isMulticastIPv4(temp)) { std::fprintf(stderr, "warning: --rewrite-mgroup is not in 224.0.0.0/4; proceeding anyway\n"); }
-            g_newDstGroup = temp; g_haveNewDstGroup = true;
-        } else if (std::strcmp(argv[i], "--rewrite-dport") == 0 && i + 1 < argc) {
-            unsigned long v = std::strtoul(argv[++i], nullptr, 0);
-            if (v == 0 || v > 65535) { std::fprintf(stderr, "error: invalid port for --rewrite-dport\n"); return 2; }
-            g_newDstPort = static_cast<uint16_t>(v);
-        } else if (std::strcmp(argv[i], "--rewrite-l2") == 0) {
-            g_rewriteL2 = true;
-        } else {
-            std::fprintf(stderr, "error: unknown option '%s'\n", argv[i]);
-            return 2;
-        }
-    }
-
-    // Reader (pcap or pcapng)
-    IFileReaderDevice* reader = IFileReaderDevice::getReader(inPath);
-    if (!reader || !reader->open()) { std::fprintf(stderr, "error: cannot open input '%s'\n", inPath); return 1; }
-
-    // Writer with same link-layer type
-    PcapFileWriterDevice writer(outPath, reader->getLinkLayerType());
-    if (!writer.open()) { std::fprintf(stderr, "error: cannot open output '%s'\n", outPath); reader->close(); delete reader; return 1; }
-
-    // Two-packet sliding window
-    RawPacket curRaw, nextRaw;
-    bool haveCur = reader->getNextPacket(curRaw);
-    if (!haveCur) { reader->close(); delete reader; writer.close(); return 0; }
-    bool haveNext = reader->getNextPacket(nextRaw);
-
-    uint64_t inCount = 0, outCount = 0, edited = 0;
-
-    while (haveCur) {
-        ++inCount;
-        Packet curPkt(&curRaw);
-
-        // 1) Timestamp extraction and option injection BEFORE any rewrites
-        uint8_t ts_this[8] = {0};
-        bool ok_this = extract_spcast_send_ts8(curPkt, ts_this);
-
-        uint8_t ts_next[8] = {0};
-        bool ok_next = false;
-        if (haveNext) {
-            Packet nextPkt(&nextRaw);
-            if (!g_requireSameFlow || same5tuple_unmodified(curPkt, nextPkt))
-                ok_next = extract_spcast_send_ts8(nextPkt, ts_next);
-        }
-        if (!haveNext || (g_requireSameFlow && !ok_next)) {
-            if (ok_this) { std::memcpy(ts_next, ts_this, 8); ok_next = true; }
-        }
-
-        bool modified = false;
-        if (ok_this && ok_next) {
-            if (add_next_ts_to_ipopts(curPkt, ts_next)) modified = true;
-            else std::fprintf(stderr, "warn: packet %llu: could not add IPv4 option (space?)\n", (unsigned long long)inCount);
-        }
-
-        // 2) Apply rewrites (IP dst / UDP dport / L2 dest MAC)
-        if (apply_rewrites(curPkt)) modified = true;
-
-        // 3) Recompute checksums/lengths if needed
-        if (modified) { curPkt.computeCalculateFields(); ++edited; }
-
-        // 4) Write out
-        if (!writer.writePacket(*curPkt.getRawPacket()))
-            std::fprintf(stderr, "warn: failed to write packet %llu\n", (unsigned long long)inCount);
-        else
-            ++outCount;
-
-        // Slide window
-        if (!haveNext) break;
-        curRaw = nextRaw;
-        haveCur = true;
-        haveNext = reader->getNextPacket(nextRaw);
-    }
-
-    reader->close();
-    delete reader;
-    writer.close();
-
-    std::fprintf(stderr, "Processed %llu packets; wrote %llu; edited %llu.\n",
-                 (unsigned long long)inCount,
-                 (unsigned long long)outCount,
-                 (unsigned long long)edited);
-    return 0;
-}
+        } else if
