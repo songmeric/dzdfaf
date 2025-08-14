@@ -2,98 +2,110 @@
 //
 // File: ipopt_ts_spcast_v3.cpp
 //
-// SUMMARY (what this program does):
-//   - Reads a classic PCAP (Ethernet link type preserved) and walks packets in order
-//     using a 2‑packet sliding window: packet i ("current") and packet i+1 ("next").
-//   - For UDP packets that carry Spcast V3, it extracts the 8‑byte send_timestamp_ns
-//     from the UDP payload of the current packet and from the next packet
-//     (or duplicates current for the last packet).
-//   - It then inserts a single IPv4 option in the *current* packet containing 8 bytes:
-//       [ ts_next(8) ]
-//     using IPv4 option type IPV4OPT_DynamicPacketState as a generic TLV container.
-//   - The IPv4 header is padded with NOPs so its length is 4‑byte aligned, and
-//     all dependent fields are recomputed (IPv4 total length & checksum, UDP checksum).
-//   - Packets that are not UDP/Spcast V3 or have insufficient payload are copied unchanged.
+// PURPOSE:
+//   - Read a PCAP/PCAPNG file and walk packets with a 2-packet sliding window.
+//   - For UDP packets carrying Spcast V3, extract 8-byte send_timestamp_ns and
+//     write ONLY the *next* packet's timestamp into an IPv4 option on the *current* packet.
+//   - Optionally rewrite the IPv4 destination multicast group and UDP destination port,
+//     and (optionally) rewrite the Ethernet destination MAC to match the new multicast IP.
+//   - Recompute all dependent fields (IPv4 total length & checksum, UDP checksum).
 //
-// NOTES & ASSUMPTIONS
-//   • Spcast V3 layout in the UDP payload is treated as: [ver:1][recv:8][send:8]
-//     so send_timestamp_ns is at offset +9. You can override this with --send-off N.
-//   • Optionally require the next packet to be the same 5‑tuple (src/dst IP, src/dst port)
-//     by passing --same-flow. Otherwise, the immediate next packet is used.
-//   • Adding IPv4 options increases header size; some networks slow‑path/drop such packets.
-//     This tool is meant for offline analysis or controlled replay, not production routing.
-//
-// BUILD (Linux/macOS)
+// BUILD (Linux/macOS):
 //   g++ -O2 -std=c++17 ipopt_ts_spcast_v3.cpp \
 //       -lPcap++ -lPacket++ -lCommon++ -lpcap -lpthread -o ipopt_ts_spcast_v3
 //   // If needed: -I/usr/local/include/pcapplusplus  -L/usr/local/lib
 //
-// USAGE
-//   ./ipopt_ts_spcast_v3 in.pcap out.pcap [--same-flow] [--send-off N] \
-//                        [--rewrite-mgroup A.B.C.D] [--rewrite-dport N]
-//     --same-flow         : Only use the next packet if it matches the same 5‑tuple.
-//     --send-off N        : Byte offset of send_timestamp_ns in the UDP payload (default 9).
-//     --rewrite-mgroup IP : Overwrite IPv4 destination address to this (multicast) group for all UDP packets.
-//     --rewrite-dport N   : Overwrite UDP destination port to this value for all UDP packets.
+// USAGE:
+//   ./ipopt_ts_spcast_v3 in.pcap out.pcap [options]
+//     --same-flow            Only use the next packet if it matches the same 5-tuple
+//     --send-off N           Offset of send_timestamp_ns in UDP payload (default: 9)
+//     --rewrite-mgroup IP    Overwrite IPv4 dst to this (multicast) group for UDP packets
+//     --rewrite-dport N      Overwrite UDP dst port to this value for UDP packets
+//     --rewrite-l2           Also rewrite Ethernet dst MAC to match the new multicast IP
 //
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <arpa/inet.h>
 
 #include "PcapFileDevice.h"
 #include "Packet.h"
 #include "IPv4Layer.h"
 #include "UdpLayer.h"
+#include "EthLayer.h"
 
 using namespace pcpp;
 
-// Use a stable, implementation-agnostic IPv4 option type code (experimental/measurement).
-// Casting a raw value keeps this compiling across PcapPlusPlus versions.
-static constexpr IPv4OptionType kOurIpv4OptType = static_cast<IPv4OptionType>(30);
+// Deduce the IPv4 option enum type in a portable way across PcapPlusPlus versions.
+using IPv4OptEnum = decltype(IPV4OPT_NOP);
+// Use an experimental/private-use option number. Decimal 30 (0x1E).
+static constexpr IPv4OptEnum kOurIpv4OptType = static_cast<IPv4OptEnum>(30);
 
-// --- Rewrite targets (CLI-configurable) ---
-static IPv4Address g_newDstGroup;     // multicast group to overwrite to
+// ---------------- Configuration ----------------
+static IPv4Address g_newDstGroup;            // multicast group to overwrite to
 static bool        g_haveNewDstGroup = false;
-static uint16_t    g_newDstPort      = 0;     // 0 = no change
+static uint16_t    g_newDstPort      = 0;    // 0 = no change
+static bool        g_rewriteL2       = false; // also rewrite Ethernet dest MAC
+static size_t      g_spcast_send_off = 9;    // Spcast V3 send_timestamp_ns offset ([ver:1][recv:8][send:8])
+static bool        g_requireSameFlow = false;
 
 // ---------------- Spcast V3 extraction ----------------
-static constexpr uint8_t  SPCAST_V3_VERSION = 3;
+static constexpr uint8_t SPCAST_V3_VERSION = 3;
+static constexpr size_t  MIN_SPCAST_HDR    = 1 + 8 + 8; // ver + recv + send
 
-// Default offset for send_timestamp_ns within Spcast V3 PacketHeader in UDP payload.
-// Matches a packed layout used by your other software: [ver:1][recv:8][send:8] => off=9
-static size_t g_spcast_send_off = 9; // can be overridden via --send-off N
-
-// Pull Spcast V3 send_timestamp_ns (8 bytes) from UDP payload into 'out'.
-// Returns false if not UDP, too short, or not Spcast V3.
 static bool extract_spcast_send_ts8(Packet& pkt, uint8_t out[8]) {
     UdpLayer* udp = pkt.getLayerOfType<UdpLayer>();
     if (!udp) return false;
-
-    const uint8_t* pay = udp->getLayerPayload();
-    size_t len = udp->getLayerPayloadSize();
-    if (!pay || len < 1 + 8 + 8) return false; // minimum header footprint
-
-    if (pay[0] != SPCAST_V3_VERSION) return false; // quick version check
-
-    if (len < g_spcast_send_off + 8) return false;
-    std::memcpy(out, pay + g_spcast_send_off, 8);
+    const uint8_t* payload = udp->getLayerPayload();
+    size_t payloadLen = udp->getLayerPayloadSize();
+    if (!payload || payloadLen < MIN_SPCAST_HDR) return false;
+    if (payload[0] != SPCAST_V3_VERSION) return false;
+    if (payloadLen < g_spcast_send_off + 8) return false;
+    std::memcpy(out, payload + g_spcast_send_off, 8);
     return true;
 }
 
-// ---------------- IPv4 option writer ----------------
+// ---------------- Helpers ----------------
+static bool isMulticastIPv4(const IPv4Address& ip) {
+    // 224.0.0.0/4
+    uint32_t be = htonl(ip.toInt());
+    uint8_t first = static_cast<uint8_t>(be >> 24);
+    return first >= 224 && first <= 239;
+}
 
-// Add an 8-byte TLV IPv4 option holding [ts_next], padding header to 4B boundary.
-// If options would overflow (max 40 bytes), removes existing options and retries once.
+static MacAddress multicastMacFromIPv4(const IPv4Address& ip) {
+    // RFC 1112: 01:00:5e:0xxxxxxx:xxxx:xxxx (lower 23 bits of IP)
+    uint32_t be = htonl(ip.toInt());
+    uint8_t b2 = static_cast<uint8_t>(be >> 16);
+    uint8_t b3 = static_cast<uint8_t>(be >> 8);
+    uint8_t b4 = static_cast<uint8_t>(be);
+    uint8_t macBytes[6] = {0x01, 0x00, 0x5e, static_cast<uint8_t>(b2 & 0x7F), b3, b4};
+    return MacAddress(macBytes);
+}
+
+static bool same5tuple_unmodified(const Packet& a, const Packet& b) {
+    const IPv4Layer* ipA = a.getLayerOfType<IPv4Layer>();
+    const IPv4Layer* ipB = b.getLayerOfType<IPv4Layer>();
+    const UdpLayer*  uA  = a.getLayerOfType<UdpLayer>();
+    const UdpLayer*  uB  = b.getLayerOfType<UdpLayer>();
+    if (!ipA || !ipB || !uA || !uB) return false;
+    return ipA->getSrcIPv4Address() == ipB->getSrcIPv4Address() &&
+           ipA->getDstIPv4Address() == ipB->getDstIPv4Address() &&
+           uA->getSrcPort() == uB->getSrcPort() &&
+           uA->getDstPort() == uB->getDstPort();
+}
+
+// Add an 8-byte TLV IPv4 option holding [ts_next], with padding to 4B alignment.
+// If options would exceed 60 bytes, remove existing options once and retry.
 static bool add_next_ts_to_ipopts(Packet& pkt, const uint8_t ts_next[8]) {
     IPv4Layer* ip = pkt.getLayerOfType<IPv4Layer>();
     if (!ip) return false;
 
     size_t curHdr = ip->getHeaderLen(); // includes existing options
-    const size_t addLen = 2 + 8;       // TLV: 1 type + 1 len + 8 data
+    const size_t addLen = 2 + 8;        // type(1) + len(1) + data(8)
     size_t pad = (4 - ((curHdr + addLen) % 4)) % 4;
-
     if (curHdr + addLen + pad > 60) {
         ip->removeAllOptions();
         curHdr = ip->getHeaderLen();
@@ -101,97 +113,94 @@ static bool add_next_ts_to_ipopts(Packet& pkt, const uint8_t ts_next[8]) {
         if (curHdr + addLen + pad > 60) return false;
     }
 
-    uint8_t val[8];
-    std::memcpy(val, ts_next, 8);
+    // Builder expects a non-const pointer; copy to a local buffer
+    uint8_t val[8]; std::memcpy(val, ts_next, 8);
+    IPv4OptionBuilder optBuilder(kOurIpv4OptType, val, static_cast<uint8_t>(sizeof(val)));
+    if (ip->addOption(optBuilder).isNull()) return false;
 
-    IPv4OptionBuilder optBuilder(kOurIpv4OptType, val, (uint8_t)sizeof(val));
-    auto opt = ip->addOption(optBuilder);
-    if (opt.isNull()) return false;
-
-    // Pad to 4B boundary with NOPs (use precomputed pad count)
     for (size_t i = 0; i < pad; ++i) {
         IPv4OptionBuilder nopBuilder(IPV4OPT_NOP, nullptr, 0);
         if (ip->addOption(nopBuilder).isNull()) return false;
     }
-
     return true;
 }
 
-static void compute_all(Packet& pkt) {
-    // Fix IPv4 total length + checksum, and update UDP checksum.
-    pkt.computeCalculateFields();
+// Apply IP/UDP/L2 rewrites if configured. Returns true if anything changed.
+static bool apply_rewrites(Packet& pkt) {
+    bool modified = false;
+
+    IPv4Layer* ip = pkt.getLayerOfType<IPv4Layer>();
+    if (ip && g_haveNewDstGroup) {
+        ip->setDstIPv4Address(g_newDstGroup);
+        modified = true;
+    }
+
+    UdpLayer* udp = pkt.getLayerOfType<UdpLayer>();
+    if (udp && g_newDstPort != 0) {
+        udp->setDstPort(g_newDstPort);
+        modified = true;
+    }
+
+    if (g_rewriteL2 && g_haveNewDstGroup && isMulticastIPv4(g_newDstGroup)) {
+        EthLayer* eth = pkt.getLayerOfType<EthLayer>();
+        if (eth) {
+            eth->setDestMac(multicastMacFromIPv4(g_newDstGroup));
+            modified = true;
+        }
+    }
+
+    return modified;
 }
 
-// ---------------- Optional: restrict "next" to same 5-tuple ----------------
-static bool same5tuple(const Packet& a, const Packet& b) {
-    const IPv4Layer* ipA = a.getLayerOfType<IPv4Layer>();
-    const IPv4Layer* ipB = b.getLayerOfType<IPv4Layer>();
-    const UdpLayer*  uA  = a.getLayerOfType<UdpLayer>();
-    const UdpLayer*  uB  = b.getLayerOfType<UdpLayer>();
-    if (!ipA || !ipB || !uA || !uB) return false;
-    const auto* ha = ipA->getIPv4Header();
-    const auto* hb = ipB->getIPv4Header();
-    return ha->ipSrc == hb->ipSrc && ha->ipDst == hb->ipDst &&
-           uA->getUdpHeader()->portSrc == uB->getUdpHeader()->portSrc &&
-           uA->getUdpHeader()->portDst == uB->getUdpHeader()->portDst;
-}
-
+// ---------------- Main ----------------
 int main(int argc, char** argv) {
     if (argc < 3) {
-        std::fprintf(stderr, "Usage: %s in.pcap out.pcap [--same-flow] [--send-off N]\n", argv[0]);
+        std::fprintf(stderr,
+            "Usage: %s in.pcap out.pcap [--same-flow] [--send-off N]\n"
+            "                 [--rewrite-mgroup A.B.C.D] [--rewrite-dport N] [--rewrite-l2]\n",
+            argv[0]);
         return 2;
     }
 
     const char* inPath  = argv[1];
     const char* outPath = argv[2];
-    bool requireSameFlow = false;
+
+    // Parse CLI
     for (int i = 3; i < argc; ++i) {
         if (std::strcmp(argv[i], "--same-flow") == 0) {
-            requireSameFlow = true;
+            g_requireSameFlow = true;
         } else if (std::strcmp(argv[i], "--send-off") == 0 && i + 1 < argc) {
             g_spcast_send_off = static_cast<size_t>(std::strtoul(argv[++i], nullptr, 0));
         } else if (std::strcmp(argv[i], "--rewrite-mgroup") == 0 && i + 1 < argc) {
-            IPv4Address tmp(argv[++i]);
-            if (!tmp.isValid()) {
-                std::fprintf(stderr, "error: invalid IPv4 address for --rewrite-mgroup
-");
-                return 2;
-            }
-            g_newDstGroup = tmp;
-            g_haveNewDstGroup = true;
+            IPv4Address temp(argv[++i]);
+            if (!temp.isValid()) { std::fprintf(stderr, "error: invalid IPv4 for --rewrite-mgroup\n"); return 2; }
+            if (!isMulticastIPv4(temp)) { std::fprintf(stderr, "warning: --rewrite-mgroup is not in 224.0.0.0/4; proceeding anyway\n"); }
+            g_newDstGroup = temp; g_haveNewDstGroup = true;
         } else if (std::strcmp(argv[i], "--rewrite-dport") == 0 && i + 1 < argc) {
             unsigned long v = std::strtoul(argv[++i], nullptr, 0);
-            if (v == 0 || v > 65535) {
-                std::fprintf(stderr, "error: invalid UDP port for --rewrite-dport
-");
-                return 2;
-            }
+            if (v == 0 || v > 65535) { std::fprintf(stderr, "error: invalid port for --rewrite-dport\n"); return 2; }
             g_newDstPort = static_cast<uint16_t>(v);
+        } else if (std::strcmp(argv[i], "--rewrite-l2") == 0) {
+            g_rewriteL2 = true;
+        } else {
+            std::fprintf(stderr, "error: unknown option '%s'\n", argv[i]);
+            return 2;
         }
     }
-    }
 
-    // Reader: classic PCAP
-    PcapFileReaderDevice reader(inPath);
-    if (!reader.open()) {
-        std::fprintf(stderr, "error: cannot open input pcap '%s'\n", inPath);
-        return 1;
-    }
+    // Reader (pcap or pcapng)
+    IFileReaderDevice* reader = IFileReaderDevice::getReader(inPath);
+    if (!reader || !reader->open()) { std::fprintf(stderr, "error: cannot open input '%s'\n", inPath); return 1; }
 
-    // Writer: same link-layer as input
-    LinkLayerType llt = reader.getLinkLayerType();
-    PcapFileWriterDevice writer(outPath, llt);
-    if (!writer.open()) {
-        std::fprintf(stderr, "error: cannot open output pcap '%s'\n", outPath);
-        reader.close();
-        return 1;
-    }
+    // Writer with same link-layer type
+    PcapFileWriterDevice writer(outPath, reader->getLinkLayerType());
+    if (!writer.open()) { std::fprintf(stderr, "error: cannot open output '%s'\n", outPath); reader->close(); delete reader; return 1; }
 
-    // Prime a 2-packet window
+    // Two-packet sliding window
     RawPacket curRaw, nextRaw;
-    bool haveCur = reader.getNextPacket(curRaw);
-    if (!haveCur) { reader.close(); writer.close(); return 0; }
-    bool haveNext = reader.getNextPacket(nextRaw);
+    bool haveCur = reader->getNextPacket(curRaw);
+    if (!haveCur) { reader->close(); delete reader; writer.close(); return 0; }
+    bool haveNext = reader->getNextPacket(nextRaw);
 
     uint64_t inCount = 0, outCount = 0, edited = 0;
 
@@ -199,72 +208,53 @@ int main(int argc, char** argv) {
         ++inCount;
         Packet curPkt(&curRaw);
 
-        bool modified_addrport = false;
-        // Apply multicast group / port rewrite for all UDP packets if requested
-        if (IPv4Layer* ip = curPkt.getLayerOfType<IPv4Layer>()) {
-            if (g_haveNewDstGroup) {
-                ip->setDstIPv4Address(g_newDstGroup);
-                modified_addrport = true;
-            }
-        }
-        if (UdpLayer* udp = curPkt.getLayerOfType<UdpLayer>()) {
-            if (g_newDstPort != 0) {
-                udp->setDstPort(g_newDstPort);
-                modified_addrport = true;
-            }
-        }
-
+        // 1) Timestamp extraction and option injection BEFORE any rewrites
         uint8_t ts_this[8] = {0};
         bool ok_this = extract_spcast_send_ts8(curPkt, ts_this);
 
         uint8_t ts_next[8] = {0};
         bool ok_next = false;
-
         if (haveNext) {
             Packet nextPkt(&nextRaw);
-            if (!requireSameFlow || same5tuple(curPkt, nextPkt)) {
+            if (!g_requireSameFlow || same5tuple_unmodified(curPkt, nextPkt))
                 ok_next = extract_spcast_send_ts8(nextPkt, ts_next);
-            }
         }
-        if (!haveNext || (requireSameFlow && !ok_next)) {
-            // last packet OR next not same flow: duplicate current ts
+        if (!haveNext || (g_requireSameFlow && !ok_next)) {
             if (ok_this) { std::memcpy(ts_next, ts_this, 8); ok_next = true; }
         }
 
-        bool modified_option = false;
+        bool modified = false;
         if (ok_this && ok_next) {
-            if (add_next_ts_to_ipopts(curPkt, ts_next)) {
-                modified_option = true;
-            } else {
-                std::fprintf(stderr, "warn: packet %llu: could not add IPv4 option (space?) — unchanged
-", (unsigned long long)inCount);
-            }
+            if (add_next_ts_to_ipopts(curPkt, ts_next)) modified = true;
+            else std::fprintf(stderr, "warn: packet %llu: could not add IPv4 option (space?)\n", (unsigned long long)inCount);
         }
 
-        if (modified_addrport || modified_option) {
-            compute_all(curPkt);
-            ++edited;
-        }
+        // 2) Apply rewrites (IP dst / UDP dport / L2 dest MAC)
+        if (apply_rewrites(curPkt)) modified = true;
 
-        // Write current packet (possibly edited)
-        if (!writer.writePacket(*curPkt.getRawPacket())) {
+        // 3) Recompute checksums/lengths if needed
+        if (modified) { curPkt.computeCalculateFields(); ++edited; }
+
+        // 4) Write out
+        if (!writer.writePacket(*curPkt.getRawPacket()))
             std::fprintf(stderr, "warn: failed to write packet %llu\n", (unsigned long long)inCount);
-        } else {
+        else
             ++outCount;
-        }
 
         // Slide window
         if (!haveNext) break;
         curRaw = nextRaw;
         haveCur = true;
-        haveNext = reader.getNextPacket(nextRaw);
+        haveNext = reader->getNextPacket(nextRaw);
     }
 
-    reader.close();
+    reader->close();
+    delete reader;
     writer.close();
 
     std::fprintf(stderr, "Processed %llu packets; wrote %llu; edited %llu.\n",
-                 (unsigned long long)inCount, (unsigned long long)outCount, (unsigned long long)edited);
-
+                 (unsigned long long)inCount,
+                 (unsigned long long)outCount,
+                 (unsigned long long)edited);
     return 0;
 }
