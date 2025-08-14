@@ -169,4 +169,118 @@ int main(int argc, char** argv) {
     for (int i = 3; i < argc; ++i) {
         if (std::strcmp(argv[i], "--same-flow") == 0) {
             g_requireSameFlow = true;
-        } else if
+        } else if (std::strcmp(argv[i], "--send-off") == 0 && i + 1 < argc) {
+            g_spcast_send_off = static_cast<size_t>(std::strtoul(argv[++i], nullptr, 0));
+        } else if (std::strcmp(argv[i], "--rewrite-mgroup") == 0 && i + 1 < argc) {
+            const char* s = argv[++i];
+            in_addr a{};
+            if (inet_pton(AF_INET, s, &a) != 1) {
+                std::fprintf(stderr, "error: invalid IPv4 for --rewrite-mgroup\n");
+                return 2;
+            }
+            uint32_t hostOrder = ntohl(a.s_addr);
+            g_newDstGroup = IPv4Address(hostOrder);
+            g_haveNewDstGroup = true;
+            if (!isMulticastIPv4(g_newDstGroup)) {
+                std::fprintf(stderr, "warning: --rewrite-mgroup is not in 224.0.0.0/4; proceeding anyway\n");
+            }
+        } else if (std::strcmp(argv[i], "--rewrite-dport") == 0 && i + 1 < argc) {
+            unsigned long v = std::strtoul(argv[++i], nullptr, 0);
+            if (v == 0 || v > 65535) {
+                std::fprintf(stderr, "error: invalid port for --rewrite-dport\n");
+                return 2;
+            }
+            g_newDstPort = static_cast<uint16_t>(v);
+        } else if (std::strcmp(argv[i], "--rewrite-l2") == 0) {
+            g_rewriteL2 = true;
+        } else {
+            std::fprintf(stderr, "error: unknown option '%s'\n", argv[i]);
+            return 2;
+        }
+    }
+
+    // Reader (pcap or pcapng)
+    IFileReaderDevice* reader = IFileReaderDevice::getReader(inPath);
+    if (!reader || !reader->open()) {
+        std::fprintf(stderr, "error: cannot open input '%s'\n", inPath);
+        return 1;
+    }
+
+    // Prime sliding window: read first packet *before* creating the writer,
+    // then construct the writer with this packet's link-layer type.
+    RawPacket curRaw, nextRaw;
+    bool haveCur = reader->getNextPacket(curRaw);
+    if (!haveCur) {
+        reader->close();
+        delete reader;
+        return 0;
+    }
+
+    // Create writer using the first packet's link-layer type
+    LinkLayerType llt = curRaw.getLinkLayerType();
+    PcapFileWriterDevice writer(outPath, llt);
+    if (!writer.open()) {
+        std::fprintf(stderr, "error: cannot open output '%s'\n", outPath);
+        reader->close();
+        delete reader;
+        return 1;
+    }
+
+    bool haveNext = reader->getNextPacket(nextRaw);
+
+    uint64_t inCount = 0, outCount = 0, edited = 0;
+
+    while (haveCur) {
+        ++inCount;
+        Packet curPkt(&curRaw);
+
+        // 1) Timestamp extraction and option injection BEFORE any rewrites
+        uint8_t ts_this[8] = {0};
+        bool ok_this = extract_spcast_send_ts8(curPkt, ts_this);
+
+        uint8_t ts_next[8] = {0};
+        bool ok_next = false;
+        if (haveNext) {
+            Packet nextPkt(&nextRaw);
+            if (!g_requireSameFlow || same5tuple_unmodified(curPkt, nextPkt))
+                ok_next = extract_spcast_send_ts8(nextPkt, ts_next);
+        }
+        if (!haveNext || (g_requireSameFlow && !ok_next)) {
+            if (ok_this) { std::memcpy(ts_next, ts_this, 8); ok_next = true; }
+        }
+
+        bool modified = false;
+        if (ok_this && ok_next) {
+            if (add_next_ts_to_ipopts(curPkt, ts_next)) modified = true;
+            else std::fprintf(stderr, "warn: packet %llu: could not add IPv4 option (space?)\n", (unsigned long long)inCount);
+        }
+
+        // 2) Apply rewrites (IP dst / UDP dport / L2 dest MAC)
+        if (apply_rewrites(curPkt)) modified = true;
+
+        // 3) Recompute checksums/lengths if needed
+        if (modified) { curPkt.computeCalculateFields(); ++edited; }
+
+        // 4) Write out
+        if (!writer.writePacket(*curPkt.getRawPacket()))
+            std::fprintf(stderr, "warn: failed to write packet %llu\n", (unsigned long long)inCount);
+        else
+            ++outCount;
+
+        // Slide window
+        if (!haveNext) break;
+        curRaw = nextRaw;
+        haveCur = true;
+        haveNext = reader->getNextPacket(nextRaw);
+    }
+
+    reader->close();
+    delete reader;
+    writer.close();
+
+    std::fprintf(stderr, "Processed %llu packets; wrote %llu; edited %llu.\n",
+                 (unsigned long long)inCount,
+                 (unsigned long long)outCount,
+                 (unsigned long long)edited);
+    return 0;
+}
