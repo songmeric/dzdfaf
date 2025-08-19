@@ -3,6 +3,7 @@
 
 Runs application, simulator, and capture processes in parallel across nyzls410d/411d/593d hosts.
 Collects PCAP, dropcopy archives, execution logs, and PME benchmark results.
+Cleans up GTAD shared memory (/dev/shm/gta_its_test1_main) on application host after test completion.
 
 All binary paths and file locations are configurable via the YAML config file,
 making this script version-agnostic and adaptable to different environments.
@@ -158,6 +159,19 @@ echo {shlex.quote(tar_path)}
             raise FileNotFoundError("Could not locate any dropcopy_mseu_* on application host.")
         raise RuntimeError(f"[{ssh.host}] dropcopy tar failed (exit {code}).\nSTDOUT:\n{out}\nSTDERR:\n{err}")
     return out.strip().splitlines()[-1].strip()
+
+
+def cleanup_shared_memory(ssh: SSH, host: str) -> None:
+    """Clean up GTAD shared memory file to prevent permission issues for next run."""
+    try:
+        cleanup_cmd = "rm /dev/shm/gta_its_test1_main"
+        code, out, err = ssh.run(cleanup_cmd)
+        if code == 0:
+            logger.info(f"[{host}] Cleaned up shared memory /dev/shm/gta_its_test1_main")
+        else:
+            logger.debug(f"[{host}] Shared memory cleanup: {err if err else out}")
+    except Exception as e:
+        logger.debug(f"[{host}] Failed to clean shared memory: {e}")
 
 
 def stage_capture_pcap_copy(ssh: SSH, tag: str, pcap_path: str) -> str:
@@ -439,6 +453,16 @@ def main():
     logger.info("  PCAP: %s", local_pcap.name)
     logger.info("  Dropcopy: %s", local_dropcopy.name)
     logger.info("  PME results: %s", local_csv.name)
+    
+    # Clean up shared memory on application host to prevent permission issues
+    logger.info("Cleaning up shared memory on application host...")
+    try:
+        with SSH(APP_HOST, ssh_user) as app_ssh:
+            cleanup_shared_memory(app_ssh, APP_HOST)
+    except Exception as e:
+        logger.debug(f"Failed to connect to {APP_HOST} for cleanup: {e}")
+    
+    logger.info("Cleanup complete")
     return 0
 
 
