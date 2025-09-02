@@ -1,0 +1,58 @@
+# Example configuration demonstrating phased execution with path overrides
+# The test framework now runs in three distinct phases:
+# 1. Preparation: Config generation and binary verification
+# 2. Simulation: Benchmark execution on 410d and 411d
+# 3. Post-processing: PME analysis and artifact collection
+
+version_name: "gtad_phased"
+
+# Path configuration for the three-phase execution
+# All paths can be overridden here - defaults are shown as comments
+paths:
+  # Preparation phase paths
+  gtad_binary: "/opt/sp/gtad/10.2/bin/gtad"
+  gtad_config_dir: "/lxhome/songjoon/gtadconfig"  # Where configs are generated
+  config_gen_script: "/apps/gtad_test/run_config_gen.sh"  # Config generation script
+  
+  # Simulation phase paths
+  onload_profile: "/lxhome/songjoon/gtadconfig/gtastart_itest/onload_profile.opf"
+  gtad_config: "/lxhome/songjoon/gtadconfig/gtastart_itest/gtad.gta_its_test1_main.xml"
+  gtad_log: "/apps/sp_hfts/gtad_log"
+  sim_command: "/lxhome/songjoon/gtad_new/gtad/tests/ez_test/run"
+  
+  # Capture paths (starts in preparation, used in post-processing)
+  pcap_output: "/apps/home/songjoon/pme_test.pcap"
+  
+  # Post-processing phase paths
+  dropcopy_glob: "/apps/sp_hfts/gtad_store/dropcopy_mseu_*"
+  dropcopy_decoder: "/opt/sp/gtad/10.2/scripts/dropcopy_decoder"
+  pme_dir: "/apps/sp_hfts/pme"
+  pme_binary: "./build/pme"
+  pme_config: "../gtadtest.yaml"
+  pme_output: "/apps/sp_hfts/pme/output/gtadtest_results.csv"
+
+# Test configuration (sent to simulator)
+tests:
+  warmup:
+    duration: 10
+    config:
+      rate: 100
+      message_type: "order"
+      
+  baseline:
+    duration: 30
+    config:
+      rate: 500
+      message_type: "order"
+      
+  stress:
+    duration: 20
+    config:
+      rate: 1000
+      message_type: "mixed"
+
+# Additional configuration options
+config:
+  capture_market_data: true
+  enable_logging: true
+  log_level: "INFO"
