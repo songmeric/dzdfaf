@@ -1,0 +1,602 @@
+#!/usr/bin/env python3
+"""ATP benchmark orchestration across three-host setup.
+
+Runs application, simulator, and capture processes in parallel across nyzls410d/411d/593d hosts.
+Collects PCAP, dropcopy archives, execution logs, and PME benchmark results.
+Cleans up GTAD shared memory (/dev/shm/gta_its_test1_main) on application host after test completion.
+
+All binary paths and file locations are configurable via the YAML config file,
+making this script version-agnostic and adaptable to different environments.
+
+Usage:
+    python3 perf_test_run.py --config config.yaml [--user username] [--outdir ./artifacts]
+
+See example_config_with_paths.yaml for path configuration options.
+"""
+
+import argparse
+import base64
+import datetime as dt
+import getpass
+import json
+import logging
+import pathlib
+import shlex
+import sys
+import time
+from typing import Tuple, Optional, Dict, Any
+
+import paramiko
+
+APP_HOST = "nyzls410d"
+SIM_HOST = "nyzls411d"
+CAP_HOST = "nyzls593d"
+
+# Default paths (can be overridden in config)
+DEFAULT_PATHS = {
+    "gtad_binary": "/opt/sp/gtad/10.2/bin/gtad",
+    "gtad_config_dir": "/lxhome/songjoon/gtadconfig",
+    "config_gen_script": "/apps/gtad_test/run_config_gen.sh",
+    "onload_profile": "/lxhome/songjoon/gtadconfig/gtastart_itest/onload_profile.opf",
+    "gtad_config": "/lxhome/songjoon/gtadconfig/gtastart_itest/gtad.gta_its_test1_main.xml",
+    "gtad_log": "/apps/sp_hfts/gtad_log",
+    "sim_command": "/lxhome/songjoon/gtad_new/gtad/tests/ez_test/run",
+    "pcap_output": "/apps/home/songjoon/pme_test.pcap",
+    "dropcopy_glob": "/apps/sp_hfts/gtad_store/dropcopy_mseu_*",
+    "dropcopy_decoder": "/opt/sp/gtad/10.2/scripts/dropcopy_decoder",
+    "pme_dir": "/apps/sp_hfts/pme",
+    "pme_binary": "./build/pme",
+    "pme_config": "../gtadtest.yaml",
+    "pme_output": "/apps/sp_hfts/pme/output/gtadtest_results.csv"
+}
+
+
+def setup_logger(log_level: str, log_file: str = None) -> logging.Logger:
+    """Configure logging to console and optionally to file."""
+    logger = logging.getLogger("perf_test_run")
+    logger.setLevel(getattr(logging, log_level.upper()))
+    logger.handlers.clear()
+    
+    formatter = logging.Formatter(
+        '%(asctime)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(getattr(logging, log_level.upper()))
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
+    
+    if log_file:
+        file_handler = logging.FileHandler(log_file)
+        file_handler.setLevel(logging.DEBUG)
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+    
+    return logger
+
+logger = logging.getLogger("perf_test_run")
+
+
+class SSH:
+    """SSH connection wrapper using default system authentication."""
+
+    def __init__(self, host: str, user: Optional[str] = None, timeout: int = 20):
+        self.host = host
+        self.user = user or getpass.getuser()
+        self.timeout = timeout
+        self.client = None
+        self.sftp = None
+
+    def __enter__(self):
+        self.client = paramiko.SSHClient()
+        self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        self.client.connect(
+            self.host,
+            username=self.user,
+            timeout=self.timeout,
+            look_for_keys=True,
+            allow_agent=True,
+        )
+        self.sftp = self.client.open_sftp()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            if self.sftp:
+                self.sftp.close()
+        finally:
+            if self.client:
+                self.client.close()
+
+    def run(self, command: str) -> Tuple[int, str, str]:
+        """Execute command and return (exit_code, stdout, stderr)."""
+        quoted = shlex.quote(command)
+        stdin, stdout, stderr = self.client.exec_command(f"bash -lc {quoted}")
+        out = stdout.read().decode("utf-8", errors="replace")
+        err = stderr.read().decode("utf-8", errors="replace")
+        code = stdout.channel.recv_exit_status()
+        return code, out, err
+
+    def get(self, remote_path: str, local_path: str):
+        pathlib.Path(local_path).parent.mkdir(parents=True, exist_ok=True)
+        self.sftp.get(remote_path, local_path)
+
+
+def start_background_with_timeout(ssh: SSH, raw_cmd: str, duration_s: int, tag: str, role: str):
+    """Start remote command in background with optional timeout."""
+    remote_log = f"/tmp/{tag}_{role}.out"
+    
+    if duration_s > 0:
+        cmd = f"nohup timeout {duration_s}s sh -c {shlex.quote(raw_cmd)} >{remote_log} 2>&1 < /dev/null &"
+    else:
+        cmd = f"nohup sh -c {shlex.quote(raw_cmd)} >{remote_log} 2>&1 < /dev/null &"
+
+    code, out, err = ssh.run(cmd)
+    if code != 0:
+        raise RuntimeError(
+            f"[{ssh.host}] failed to start '{role}' (exit {code}).\nSTDOUT:\n{out}\nSTDERR:\n{err}"
+        )
+    return remote_log
+
+
+def stage_latest_dropcopy_tar(ssh: SSH, tag: str, dropcopy_glob: str) -> str:
+    """Archive the latest dropcopy_mseu_* directory to tar.gz."""
+    tar_path = f"/tmp/dropcopy_latest_{tag}.tgz"
+    cmd = f"""
+set -euo pipefail
+latest=$(ls -1dt {dropcopy_glob} 2>/dev/null | head -1 || true)
+if [ -z "${{latest:-}}" ]; then
+  echo "NO_DROPCOPY" ; exit 5
+fi
+base=$(basename "$latest")
+dir=$(dirname "$latest")
+rm -f {shlex.quote(tar_path)}
+tar -C "$dir" -czf {shlex.quote(tar_path)} "$base"
+echo {shlex.quote(tar_path)}
+"""
+    code, out, err = ssh.run(cmd)
+    if code != 0:
+        if "NO_DROPCOPY" in out:
+            raise FileNotFoundError("Could not locate any dropcopy_mseu_* on application host.")
+        raise RuntimeError(f"[{ssh.host}] dropcopy tar failed (exit {code}).\nSTDOUT:\n{out}\nSTDERR:\n{err}")
+    return out.strip().splitlines()[-1].strip()
+
+
+def cleanup_shared_memory(ssh: SSH, host: str) -> None:
+    """Clean up GTAD shared memory file to prevent permission issues for next run."""
+    try:
+        cleanup_cmd = "rm /dev/shm/gta_its_test1_main"
+        code, out, err = ssh.run(cleanup_cmd)
+        if code == 0:
+            logger.info(f"[{host}] Cleaned up shared memory /dev/shm/gta_its_test1_main")
+        else:
+            logger.debug(f"[{host}] Shared memory cleanup: {err if err else out}")
+    except Exception as e:
+        logger.debug(f"[{host}] Failed to clean shared memory: {e}")
+
+
+def stage_capture_pcap_copy(ssh: SSH, tag: str, pcap_path: str) -> str:
+    """Copy PCAP file to /tmp with unique name."""
+    staged = f"/tmp/pme_test_{tag}.pcap"
+    cmd = f"""
+set -e
+if [ ! -f {shlex.quote(pcap_path)} ]; then
+  echo "MISSING_PCAP"
+  exit 6
+fi
+cp -f {shlex.quote(pcap_path)} {shlex.quote(staged)}
+echo {shlex.quote(staged)}
+"""
+    code, out, err = ssh.run(cmd)
+    if code != 0:
+        if "MISSING_PCAP" in out:
+            raise FileNotFoundError(f"{pcap_path} not found on capture host.")
+        raise RuntimeError(f"[{ssh.host}] staging PCAP failed (exit {code}).\nSTDOUT:\n{out}\nSTDERR:\n{err}")
+    return out.strip().splitlines()[-1].strip()
+
+
+def load_and_encode_config(config_path: str) -> Tuple[str, int, Dict[str, str], str]:
+    """Load config file (JSON/YAML) and return base64-encoded JSON, total duration, paths, and version name."""
+    p = pathlib.Path(config_path)
+    if not p.is_file():
+        raise FileNotFoundError(f"Config file not found: {config_path}")
+
+    raw = p.read_text(encoding="utf-8")
+    ext = p.suffix.lower()
+    if ext in ('.yaml', '.yml'):
+        try:
+            import yaml
+        except ImportError:
+            raise ImportError("PyYAML is required to parse YAML config files. Install with: pip install pyyaml")
+        
+        try:
+            parsed = yaml.safe_load(raw)
+        except Exception as exc:
+            raise ValueError(f"Config is not valid YAML: {exc}") from exc
+    elif ext == '.json':
+        try:
+            parsed = json.loads(raw)
+        except Exception as exc:
+            raise ValueError(f"Config is not valid JSON: {exc}") from exc
+    else:
+        try:
+            parsed = json.loads(raw)
+        except:
+            try:
+                import yaml
+                parsed = yaml.safe_load(raw)
+            except Exception as exc:
+                raise ValueError(f"Config is neither valid JSON nor YAML: {exc}") from exc
+    
+    total_duration = 0
+    tests = parsed.get("tests", {})
+    if tests:
+        for test_name, test_cfg in tests.items():
+            if isinstance(test_cfg, dict) and "duration" in test_cfg:
+                total_duration += test_cfg["duration"]
+    
+    if total_duration == 0:
+        total_duration = 60
+    
+    # Extract paths from config or use defaults
+    paths = DEFAULT_PATHS.copy()
+    config_paths = parsed.get("paths", {})
+    if config_paths:
+        paths.update(config_paths)
+    
+    # Extract version name (optional, defaults to "gtad")
+    version_name = parsed.get("version_name", "gtad")
+    
+    # Remove paths and version_name from the config before encoding for simulator
+    # (simulator doesn't need to know about these)
+    sim_config = parsed.copy()
+    sim_config.pop("paths", None)
+    sim_config.pop("version_name", None)
+    
+    minified = json.dumps(sim_config, separators=(",", ":"))
+    encoded = base64.b64encode(minified.encode("utf-8")).decode("ascii")
+    return encoded, total_duration, paths, version_name
+
+
+def build_simulator_cmd(sim_command: str, config_b64: str, extra_args: str | None = None) -> str:
+    """Build simulator command with base64-encoded config."""
+    parts = [sim_command, "-c", config_b64]
+    if extra_args:
+        parts.append(extra_args.strip())
+    return " ".join(parts)
+
+
+def build_capture_cmd(pcap_path: str) -> str:
+    """Build capture command with configurable PCAP output path."""
+    return (
+        'solar_capture interface=sfc0 '
+        f'output="{pcap_path}" '
+        'format=pcap-ns '
+        'join_streams="udp:239.254.64.2:31103;tcp:192.168.163.5:2528;" '
+        'arista_ts="kf_ip_dest=255.255.255.255;kf_eth_dhost=ff:ff:ff:ff:ff:ff"'
+    )
+
+
+def run_preparation_phase(ssh_user: str, paths: Dict[str, str], tag: str) -> None:
+    """Phase 1: Preparation - Generate configs and verify binaries exist."""
+    logger.info("=" * 60)
+    logger.info("PHASE 1: PREPARATION")
+    logger.info("=" * 60)
+    
+    # 1. Generate config on 410d
+    logger.info(f"[{APP_HOST}] Generating GTAD configuration...")
+    with SSH(APP_HOST, ssh_user) as app_ssh:
+        config_gen_cmd = f"{paths['config_gen_script']} {paths['gtad_binary']}"
+        code, out, err = app_ssh.run(config_gen_cmd)
+        if code != 0:
+            logger.error(f"[{APP_HOST}] Config generation failed (exit {code})")
+            logger.error(f"STDOUT: {out}")
+            logger.error(f"STDERR: {err}")
+            raise RuntimeError(f"Failed to generate GTAD config on {APP_HOST}")
+        logger.info(f"[{APP_HOST}] Config generation completed successfully")
+        
+        # 2. Check if GTAD binary exists on 410d
+        logger.info(f"[{APP_HOST}] Verifying GTAD binary exists at {paths['gtad_binary']}...")
+        check_cmd = f"test -f {shlex.quote(paths['gtad_binary'])} && echo 'BINARY_EXISTS' || echo 'BINARY_MISSING'"
+        code, out, err = app_ssh.run(check_cmd)
+        if "BINARY_MISSING" in out or code != 0:
+            raise FileNotFoundError(f"GTAD binary not found at {paths['gtad_binary']} on {APP_HOST}")
+        logger.info(f"[{APP_HOST}] GTAD binary verified")
+        
+        # 3. Check if GTAD config was generated successfully
+        logger.info(f"[{APP_HOST}] Verifying GTAD config exists at {paths['gtad_config']}...")
+        check_config = f"test -f {shlex.quote(paths['gtad_config'])} && echo 'CONFIG_EXISTS' || echo 'CONFIG_MISSING'"
+        code, out, err = app_ssh.run(check_config)
+        if "CONFIG_MISSING" in out or code != 0:
+            raise FileNotFoundError(f"GTAD config not found at {paths['gtad_config']} on {APP_HOST}")
+        logger.info(f"[{APP_HOST}] GTAD config verified")
+    
+    # 4. Check if simulator run script exists on 411d
+    logger.info(f"[{SIM_HOST}] Verifying simulator script exists at {paths['sim_command']}...")
+    with SSH(SIM_HOST, ssh_user) as sim_ssh:
+        check_cmd = f"test -f {shlex.quote(paths['sim_command'])} && echo 'SCRIPT_EXISTS' || echo 'SCRIPT_MISSING'"
+        code, out, err = sim_ssh.run(check_cmd)
+        if "SCRIPT_MISSING" in out or code != 0:
+            raise FileNotFoundError(f"Simulator script not found at {paths['sim_command']} on {SIM_HOST}")
+        logger.info(f"[{SIM_HOST}] Simulator script verified")
+    
+    # 5. Start capture early on 593d (runs for entire test duration)
+    logger.info(f"[{CAP_HOST}] Starting packet capture early...")
+    cap_cmd = build_capture_cmd(paths["pcap_output"])
+    with SSH(CAP_HOST, ssh_user) as cap_ssh:
+        # First ensure the output directory exists
+        pcap_dir = pathlib.Path(paths["pcap_output"]).parent
+        mkdir_cmd = f"mkdir -p {shlex.quote(str(pcap_dir))}"
+        code, out, err = cap_ssh.run(mkdir_cmd)
+        if code != 0:
+            logger.warning(f"[{CAP_HOST}] Failed to create pcap directory: {err}")
+        
+        # Start capture in background (will be stopped later)
+        cap_log = start_background_with_timeout(cap_ssh, cap_cmd, 0, tag, "cap_early")
+        logger.info(f"[{CAP_HOST}] Capture started early; remote log -> {cap_log}")
+    
+    logger.info("Preparation phase completed successfully")
+    return cap_log
+
+
+def run_simulation_phase(ssh_user: str, paths: Dict[str, str], config_b64: str, 
+                        duration: int, tag: str, gap: float, sim_args: str = None) -> Tuple[str, str]:
+    """Phase 2: Simulation - Run benchmarks on 410d and 411d."""
+    logger.info("=" * 60)
+    logger.info("PHASE 2: SIMULATION")
+    logger.info("=" * 60)
+    
+    # Build application command
+    app_cmd = (
+        f'onload --profile {paths["onload_profile"]} '
+        f'{paths["gtad_binary"]} '
+        f'-c {paths["gtad_config"]} '
+        f'| grep -v "ThreadGuard" | tee {paths["gtad_log"]}'
+    )
+    
+    # Start application on 410d
+    with SSH(APP_HOST, ssh_user) as app_ssh:
+        logger.info(f"[{APP_HOST}] Starting APPLICATION...")
+        app_log = start_background_with_timeout(app_ssh, app_cmd, duration, tag, "app")
+        logger.info(f"[{APP_HOST}] Application started; remote log -> {app_log}")
+    
+    time.sleep(gap)
+    
+    # Start simulator on 411d
+    sim_cmd = build_simulator_cmd(paths["sim_command"], config_b64, sim_args)
+    with SSH(SIM_HOST, ssh_user) as sim_ssh:
+        logger.info(f"[{SIM_HOST}] Starting SIMULATOR...")
+        sim_log = start_background_with_timeout(sim_ssh, sim_cmd, duration, tag, "sim")
+        logger.info(f"[{SIM_HOST}] Simulator started; remote log -> {sim_log}")
+        logger.info(f"[{SIM_HOST}] Config: base64(JSON), length={len(config_b64)}"
+                    + (f"; extra args: {sim_args}" if sim_args else ""))
+    
+    if duration > 0:
+        wait_s = duration + 5
+        logger.info(f"Waiting {wait_s} seconds for simulation to complete...")
+        time.sleep(wait_s)
+    else:
+        logger.warning("Duration set to 0 -> simulations are running indefinitely.")
+        logger.warning("Press Ctrl+C to stop this script, then stop remote processes manually.")
+    
+    logger.info("Simulation phase completed")
+    return app_log, sim_log
+
+
+def run_postprocessing_phase(ssh_user: str, paths: Dict[str, str], tag: str, 
+                            outdir: pathlib.Path, app_log: str, sim_log: str, 
+                            cap_log: str) -> None:
+    """Phase 3: Post-processing - PME analysis and artifact collection."""
+    logger.info("=" * 60)
+    logger.info("PHASE 3: POST-PROCESSING")
+    logger.info("=" * 60)
+    
+    local_pcap = outdir / f"pme_test_{tag}.pcap"
+    local_dropcopy = outdir / f"dropcopy_latest_{tag}.tgz"
+    
+    # Stop capture and collect PCAP
+    with SSH(CAP_HOST, ssh_user) as cap_ssh:
+        # Kill the capture process
+        logger.info(f"[{CAP_HOST}] Stopping capture process...")
+        kill_cmd = "pkill -f solar_capture || true"
+        code, out, err = cap_ssh.run(kill_cmd)
+        time.sleep(2)  # Give it time to flush buffers
+        
+        logger.info(f"[{CAP_HOST}] Staging PCAP for download...")
+        staged_pcap = stage_capture_pcap_copy(cap_ssh, tag, paths["pcap_output"])
+        logger.info(f"[{CAP_HOST}] Staged PCAP at {staged_pcap}. Downloading...")
+        cap_ssh.get(staged_pcap, str(local_pcap))
+        logger.info(f"[LOCAL] PCAP saved to {local_pcap}")
+    
+    # Collect dropcopy from application host
+    staged_tar = None
+    with SSH(APP_HOST, ssh_user) as app_ssh:
+        logger.info(f"[{APP_HOST}] Archiving latest dropcopy_mseu_*...")
+        staged_tar = stage_latest_dropcopy_tar(app_ssh, tag, paths["dropcopy_glob"])
+        logger.info(f"[{APP_HOST}] Staged tar at {staged_tar}. Downloading...")
+        app_ssh.get(staged_tar, str(local_dropcopy))
+        logger.info(f"[LOCAL] Dropcopy archive saved to {local_dropcopy}")
+    
+    # Download execution logs
+    logger.info("Downloading execution logs...")
+    log_downloads = [
+        (APP_HOST, app_log, "app"),
+        (SIM_HOST, sim_log, "sim"),
+        (CAP_HOST, cap_log, "cap")
+    ]
+    
+    for host, remote_log, role in log_downloads:
+        if remote_log:
+            local_log = outdir / f"{tag}_{role}.log"
+            try:
+                with SSH(host, ssh_user) as ssh:
+                    logger.info(f"[{host}] Downloading {role} log...")
+                    ssh.get(remote_log, str(local_log))
+                    logger.info(f"[LOCAL] {role} log saved to {local_log}")
+            except Exception as e:
+                logger.warning(f"Failed to download {role} log from {host}: {e}")
+    
+    # Run PME post-processing
+    logger.info(f"[{CAP_HOST}] Running PME post-processing pipeline...")
+    try:
+        with SSH(CAP_HOST, ssh_user) as cap_ssh:
+            scp_user = ssh_user or getpass.getuser()
+            tar_path = f"/tmp/dropcopy_latest_{tag}.tgz"
+            extract_dir = f"/tmp/dropcopy_extract_{tag}"
+            
+            post_cmd = f"""set -euo pipefail
+                [ ! -f "{tar_path}" ] && scp -q -o StrictHostKeyChecking=no {scp_user}@{APP_HOST}:{staged_tar} "{tar_path}"
+                mkdir -p "{extract_dir}"
+                tar -xzf "{tar_path}" -C "{extract_dir}"
+                {paths["dropcopy_decoder"]} -i "{extract_dir}" || true
+                cd {paths["pme_dir"]} && {paths["pme_binary"]} -c {paths["pme_config"]}"""
+            
+            code, out, err = cap_ssh.run(post_cmd)
+            if code != 0:
+                logger.error(f"[{CAP_HOST}] PME processing failed (exit {code})")
+                logger.error(f"STDOUT: {out}")
+                logger.error(f"STDERR: {err}")
+                raise RuntimeError("PME post-processing failed")
+            logger.info(f"[{CAP_HOST}] PME processing completed successfully")
+            
+            # Download PME results
+            local_csv = outdir / f"{tag}_gtadtest_results.csv"
+            remote_csv = paths["pme_output"]
+            cap_ssh.get(remote_csv, str(local_csv))
+            logger.info(f"[LOCAL] PME results saved to {local_csv}")
+    except Exception as e:
+        logger.error(f"Post-processing failed: {e}")
+        raise
+    
+    # Clean up shared memory on application host
+    logger.info(f"[{APP_HOST}] Cleaning up shared memory...")
+    try:
+        with SSH(APP_HOST, ssh_user) as app_ssh:
+            cleanup_shared_memory(app_ssh, APP_HOST)
+    except Exception as e:
+        logger.debug(f"Failed to connect to {APP_HOST} for cleanup: {e}")
+    
+    logger.info("Post-processing phase completed")
+    logger.info("=" * 60)
+    logger.info("ALL PHASES COMPLETED SUCCESSFULLY")
+    logger.info("=" * 60)
+    logger.info(f"Artifacts saved to: {outdir}")
+    logger.info(f"  PCAP: {local_pcap.name}")
+    logger.info(f"  Dropcopy: {local_dropcopy.name}")
+    logger.info(f"  PME results: {local_csv.name}")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Run ATP benchmark across 410d/411d/593d and collect artifacts."
+    )
+    parser.add_argument("--config", required=True, help="Path to config file (JSON/YAML)")
+    parser.add_argument("--user", default=None, help="SSH user (default: current user)")
+    parser.add_argument("--duration", type=int, help="Override test duration in seconds")
+    parser.add_argument("--outdir", default="./artifacts", help="Output directory for artifacts")
+    parser.add_argument("--sleep-gap", type=float, default=2.0, help="Delay between starting hosts")
+    parser.add_argument("--sim-args", default="", help="Extra simulator arguments")
+    parser.add_argument("--log-level", default="INFO", 
+                        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+                        help="Logging level")
+    parser.add_argument("--skip-prep", action="store_true", 
+                        help="Skip preparation phase (config generation and checks)")
+
+    args = parser.parse_args()
+
+    ssh_user = args.user
+    gap = max(0.0, args.sleep_gap)
+    
+    # Load config early to get version name for tag
+    try:
+        config_b64, config_duration, paths, version_name = load_and_encode_config(args.config)
+    except Exception as exc:
+        print(f"Failed to load config: {exc}")
+        sys.exit(2)
+    
+    # Generate tag with version name
+    timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    tag = f"{version_name}_{timestamp}"
+    
+    outdir = pathlib.Path(args.outdir) / tag
+    outdir.mkdir(parents=True, exist_ok=True)
+    
+    log_file = outdir / f"{tag}_run.log"
+    global logger
+    logger = setup_logger(args.log_level, str(log_file))
+    
+    logger.info(f"Run tag: {tag}")
+    logger.info(f"Version: {version_name}")
+    logger.info(f"Artifacts will be saved under: {outdir}")
+    logger.info(f"Log file: {log_file}")
+    logger.debug("Using paths configuration:")
+    for key, value in paths.items():
+        logger.debug(f"  {key}: {value}")
+    
+    if args.duration is not None:
+        duration = args.duration
+        logger.info(f"Using duration override from CLI: {duration} seconds")
+    elif config_duration is not None:
+        padding = 10
+        duration = config_duration + padding
+        logger.info(f"Total test duration from config: {config_duration} seconds")
+        logger.info(f"Adding {padding}s padding for startup/shutdown")
+        logger.info(f"Total process duration: {duration} seconds")
+    else:
+        duration = 60
+        logger.info(f"No duration specified in tests, using default: {duration} seconds")
+
+    logger.info(f"Process timeout duration: {duration if duration > 0 else 'INDEFINITE'} seconds")
+
+    try:
+        # Phase 1: Preparation
+        cap_log = None
+        if not args.skip_prep:
+            cap_log = run_preparation_phase(ssh_user, paths, tag)
+        else:
+            logger.info("Skipping preparation phase (--skip-prep flag)")
+            # Still need to start capture if skipped prep
+            logger.info(f"[{CAP_HOST}] Starting capture...")
+            with SSH(CAP_HOST, ssh_user) as cap_ssh:
+                cap_cmd = build_capture_cmd(paths["pcap_output"])
+                cap_log = start_background_with_timeout(cap_ssh, cap_cmd, 0, tag, "cap")
+                logger.info(f"[{CAP_HOST}] Capture started; remote log -> {cap_log}")
+        
+        # Phase 2: Simulation
+        app_log, sim_log = run_simulation_phase(
+            ssh_user, paths, config_b64, duration, tag, gap, args.sim_args
+        )
+        
+        # Early exit for indefinite runs
+        if duration <= 0:
+            return 0
+        
+        # Phase 3: Post-processing
+        run_postprocessing_phase(
+            ssh_user, paths, tag, outdir, app_log, sim_log, cap_log
+        )
+        
+    except Exception as e:
+        logger.error(f"Execution failed: {e}")
+        logger.error("Aborting run due to error")
+        # Try to clean up shared memory even on failure
+        try:
+            with SSH(APP_HOST, ssh_user) as app_ssh:
+                cleanup_shared_memory(app_ssh, APP_HOST)
+        except:
+            pass
+        sys.exit(1)
+    
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        if 'logger' in globals():
+            logger.warning("INTERRUPTED - Exiting.")
+        else:
+            print("\n[INTERRUPTED] Exiting.")
+        sys.exit(130)
